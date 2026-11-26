@@ -1104,7 +1104,7 @@ fn copy_states(list: &crate::host::HostList, dst: This, src: This) {
 /// draw state binds the title's root signature and pipeline again.
 #[cfg(windows)]
 fn after_conversion(this: This) {
-    with_state(this, |_, state| state.host_state_lost());
+    with_state(this, |_, state| state.external_compute());
 }
 
 /// Copies left out because both sides were one host texture
