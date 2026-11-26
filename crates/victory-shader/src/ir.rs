@@ -1839,6 +1839,50 @@ mod tests {
         assert_eq!(skips(&without_skips(&idle, true).expect("left out")), 0);
     }
 
+    /// A compute program saves EXEC on entry (`s_mov_b64 s[40:41], exec`) and later skips a
+    /// region with `s_and_saveexec_b64 s[20:21], s[40:41]`: that skip is taken only when no lane
+    /// is left (EXEC never holds a lane EXEC on entry did not), so the restore of EXEC at the
+    /// join leaves none either. A descriptor the region builds (the console compiler moves a
+    /// sampler's constants into it) and only image or buffer instructions read after that
+    /// restore, before EXEC changes again, cannot tell a lane the region was skipped.
+    #[test]
+    fn a_skip_on_exec_on_entry_is_left_out_when_only_the_join_s_memory_reads_its_scalars() {
+        const SET: u32 = 0xBE86_0385; // s_mov_b32 s6, 5
+        const RESTORE: u32 = 0xBEFE_0414; // s_mov_b64 exec, s[20:21]
+        // image_sample_l v15, [v7,v8,v22], s[4:11], s[4:7] would need NSA; a buffer load
+        // takes s[4:7] as its descriptor: buffer_load_dword v2, off, s[4:7], 0
+        const LOAD: u32 = 0xE030_0000;
+        const LOAD1: u32 = 0x8001_0200;
+        let program = |mask: u32, after: &[u32]| {
+            let mut w = vec![
+                0xBEA8_047E, // s_mov_b64 s[40:41], exec
+                0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+                0xBE80_246A, // s_and_saveexec_b64 s[0:1], vcc (an outer branch: s0, s1 change)
+                mask,        // s_and_saveexec_b64 s[20:21], <mask>
+                0xBF88_0002, // s_cbranch_execz past the body
+                SET,
+                0xBE87_0380, // s_mov_b32 s7, 0
+                RESTORE,
+            ];
+            w.extend_from_slice(after);
+            w.push(S_ENDPGM);
+            build_words(&w, true)
+        };
+        const ENTRY: u32 = 0xBE94_2428; // s_and_saveexec_b64 s[20:21], s[40:41]
+        const VCC: u32 = 0xBE94_246A; // s_and_saveexec_b64 s[20:21], vcc
+        // read by a buffer instruction right after the restore: left out (deep form only)
+        let read = program(ENTRY, &[LOAD, LOAD1]);
+        assert_eq!(skips(&read), 1);
+        assert!(without_skips(&read, false).is_none());
+        assert_eq!(skips(&without_skips(&read, true).expect("left out")), 0);
+        // a skip on another mask may be taken with lanes left: kept
+        assert!(without_skips(&program(VCC, &[LOAD, LOAD1]), true).is_none());
+        // read by a vector move: kept
+        assert!(without_skips(&program(ENTRY, &[0x7E04_0206]), true).is_none());
+        // read after EXEC changed again (s_mov_b64 exec, s[40:41]): kept
+        assert!(without_skips(&program(ENTRY, &[0xBEFE_0428, LOAD, LOAD1]), true).is_none());
+    }
+
     #[test]
     fn joins_get_phis_only_where_values_differ() {
         let code = [
