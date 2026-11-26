@@ -2154,11 +2154,11 @@ mod tests {
             forget(resource);
             assert_eq!(view_at(index, generation), None, "released views go stale");
         }
-        let backlinks = VIEWS.lock().unwrap().by_resource.get(&counter).map_or(0, |entries| entries.len());
+        let backlinks = VIEWS.read().unwrap().by_resource.get(&counter).map_or(0, |entries| entries.len());
         assert_eq!(view_at(kept_index, kept_generation), Some(stable));
         forget(counter);
         assert_eq!(view_at(kept_index, kept_generation), None);
-        let kept_backlinks = VIEWS.lock().unwrap().by_resource.get(&kept).map_or(0, |entries| entries.len());
+        let kept_backlinks = VIEWS.read().unwrap().by_resource.get(&kept).map_or(0, |entries| entries.len());
         forget(kept);
         assert_eq!(backlinks, 1, "only the surviving view names the counter");
         assert_eq!(kept_backlinks, 0, "the last view leaves no reverse index");
@@ -2172,7 +2172,7 @@ mod tests {
         let [shader_index, shader_generation] = words_for(shader.clone());
         let [uav_index, uav_generation] = words_for(View::Unordered(resource, counter, None));
         forget(counter);
-        let backlinks = VIEWS.lock().unwrap().by_resource.get(&resource).map_or(0, |entries| entries.len());
+        let backlinks = VIEWS.read().unwrap().by_resource.get(&resource).map_or(0, |entries| entries.len());
         assert_eq!(view_at(uav_index, uav_generation), None);
         assert_eq!(view_at(shader_index, shader_generation), Some(shader));
         forget(resource);
@@ -2182,7 +2182,7 @@ mod tests {
         let [index, generation] = words_for(View::Unordered(resource, resource, None));
         forget(resource);
         assert_eq!(view_at(index, generation), None);
-        let views = VIEWS.lock().unwrap();
+        let views = VIEWS.read().unwrap();
         assert!(!views.by_resource.contains_key(&resource));
     }
 
