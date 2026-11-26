@@ -1296,9 +1296,10 @@ fn video_memory_percent() -> u64 {
 }
 
 /// How many of a streamed placed 2D texture's largest mips to skip so no side
-/// passes `VICTORY_TEXTURE_MAX` (0: uncapped; unset: 1024, then 512 from 92 %
-/// of the VRAM budget and 256 from 97 %, after `VIctory-vitesse` 7ada43b6).
-/// Keeps 16 GB cards from filling VRAM and stalling thousands of textures.
+/// passes the cap: `VICTORY_TEXTURE_MAX` (unset: 1024), halved from 92 % of
+/// the VRAM budget and quartered from 97 % (after `VIctory-vitesse`
+/// 7ada43b6); `0` caps nothing, at any use of the budget. Keeps 16 GB cards
+/// from filling VRAM and stalling thousands of textures.
 #[cfg(windows)]
 fn over_cap(desc: &ResourceDesc) -> u32 {
     static SET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
@@ -1310,11 +1311,7 @@ fn over_cap(desc: &ResourceDesc) -> u32 {
     if set == Some(0) {
         return 0;
     }
-    let max = set.unwrap_or_else(|| match video_memory_percent() {
-        0..92 => 1024,
-        92..97 => 512,
-        _ => 256,
-    });
+    let max = capped(set.unwrap_or(1024), video_memory_percent());
     let mut skip = 0u32;
     while (desc.width >> skip) > max || (u64::from(desc.height) >> skip) > max {
         if skip + 1 >= u32::from(desc.mip_levels) {
@@ -1323,6 +1320,33 @@ fn over_cap(desc: &ResourceDesc) -> u32 {
         skip += 1;
     }
     skip
+}
+
+/// The cap of [`over_cap`] at `percent` of the VRAM budget in use: `base`,
+/// half from 92 %, a quarter from 97 % (never under 256).
+#[cfg(any(windows, test))]
+fn capped(base: u64, percent: u64) -> u64 {
+    let cap = match percent {
+        0..92 => base,
+        92..97 => base / 2,
+        _ => base / 4,
+    };
+    cap.max(256.min(base))
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use super::capped;
+
+    #[test]
+    fn a_texture_cap_keeps_its_steps_under_vram_pressure() {
+        // The default as it was: 1024, 512 from 92 %, 256 from 97 %.
+        assert_eq!([capped(1024, 50), capped(1024, 92), capped(1024, 99)], [1024, 512, 256]);
+        // A higher cap steps down the same way.
+        assert_eq!([capped(4096, 91), capped(4096, 96), capped(4096, 97)], [4096, 2048, 1024]);
+        // Never below 256, nor above the cap asked for.
+        assert_eq!([capped(512, 99), capped(128, 99)], [256, 128]);
+    }
 }
 
 /// The level a host copy begins at for views that start at `first`: one the
