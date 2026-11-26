@@ -62,10 +62,19 @@ street: standing still, then walking and turning the camera.
 | Series X, 1080p output, ray tracing off | 40 ms (25 fps) | ~43 ms (23 fps) | 42 GB |
 | Series S, ray tracing off | 43 ms (23 fps) | ~64 ms (16 fps) | 37 GB |
 
-Known problems with ray tracing on, being worked on now: lighting flickers and
-swings between too dark and too bright even when nothing moves; dark rooms and
-backgrounds; models and textures stay at their lowest detail for a long time
-while the title streams (worst in the intro); trees flicker.
+Fixed 2026-11-26: trees and palms dropping out for a few frames, and most of the
+lighting swinging between too dark and too bright in lamp-lit rooms. Both came from
+indirect draws whose arguments sit in renderer patch 1's in-place memory being
+prepared before the title's culling had written them; they are now prepared one at
+a time right before they run (`VICTORY_PORT_CONSTANTS_ORDER`, on by default, about
+2-5 ms). Rooms lit only by bounced light are no longer black with ray tracing
+(`VICTORY_AMBIENT_RT=0.7,1.5`, which `Play-Watched.ps1 -RayTracing` sets).
+
+Still open: models and textures stay at their lowest detail for a long time while
+the title streams (worst in the intro): the title paces its streaming by its own
+frames, so it loads about three times slower at 10 fps than at 30; ray-traced
+structures of moving objects are partly corrupt (the rays follow some 450 stray
+pointers a frame).
 
 Earlier measurements with ray tracing off:
 
