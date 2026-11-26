@@ -398,9 +398,68 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
-        wait(p, crate::frame::current());
+        match compute_wait() {
+            // A dispatch: waited for until its pipeline is made, past the
+            // frame's budget (at most this long).
+            Some(most) if p.graphics.is_none() => wait_made(p, most),
+            _ => wait(p, crate::frame::current()),
+        }
     }
     p.made.get()?.as_ref()
+}
+
+/// How long a dispatch waits for its compute pipeline, whatever the
+/// frame's budget ([`wait_budget`]); a draw still waits within the budget
+/// and is dropped while its pipeline is not there.
+///
+/// A dropped draw is drawn again in the next frame. A dropped dispatch may
+/// not be: the title runs some compute passes once, when a scene changes
+/// (a buffer reset or cleared), and what they leave is read for as long as
+/// the scene lasts. In the prison corridor a compute program met for the
+/// first time took 4.4 s to make on a 16 GB machine; its one dispatch was
+/// dropped after the half second of budget, and the windows of the room
+/// before stayed blended over the whole picture for minutes
+/// (fxceless/victory-fork a42b627e7, #1312).
+///
+/// 10 s by default: a worker the driver's compiler crashed under never
+/// finishes ([`guard_start`]), so the wait has an end.
+/// `VICTORY_PIPELINE_COMPUTE_WAIT=0`: within the budget, as before; `=<ms>`:
+/// that long at most.
+fn compute_wait() -> Option<Duration> {
+    static MOST: OnceLock<Option<Duration>> = OnceLock::new();
+    *MOST.get_or_init(|| match std::env::var("VICTORY_PIPELINE_COMPUTE_WAIT").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(0) => None,
+        Some(ms) => Some(Duration::from_millis(ms)),
+        None => Some(Duration::from_secs(10)),
+    })
+}
+
+/// Waits until `p` is made, at most `most` (a worker makes it: [`start`]).
+fn wait_made(p: &Pending, most: Duration) {
+    let waiting = crate::timeline::span("pipeline: a dispatch waits for its compute pipeline");
+    let started = Instant::now();
+    let (lock, done) = &DONE;
+    let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while p.made.get().is_none() {
+        let rest = most.saturating_sub(started.elapsed());
+        if rest.is_zero() {
+            break;
+        }
+        held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
+    }
+    drop(held);
+    waiting.end();
+    let waited = started.elapsed();
+    if waited > Duration::from_millis(500) {
+        tracing::info!(
+            ms = waited.as_millis() as u64,
+            made = p.made.get().is_some(),
+            shaders = ?p.shaders,
+            "a dispatch waited for its compute pipeline (VICTORY_PIPELINE_COMPUTE_WAIT=0: dropped past the frame's budget)"
+        );
+    }
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::PipelineWaitUs, waited.as_micros() as u64);
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
