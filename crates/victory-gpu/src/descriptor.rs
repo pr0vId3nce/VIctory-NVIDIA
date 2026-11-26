@@ -1091,7 +1091,7 @@ struct Views {
     list: Vec<(View, u32)>,
     index: std::collections::BTreeMap<View, u32>,
     /// Entries naming each resource.
-    by_resource: std::collections::BTreeMap<usize, Vec<u32>>,
+    by_resource: std::collections::BTreeMap<usize, std::collections::BTreeSet<u32>>,
     free: Vec<u32>,
     /// The shapes of views of placed memory, and where each is.
     shapes: Vec<Shape>,
@@ -1252,7 +1252,7 @@ impl Views {
                     }
                 };
                 for r in view.resources().into_iter().filter(|&r| r != 0) {
-                    self.by_resource.entry(r).or_default().push(i);
+                    self.by_resource.entry(r).or_default().insert(i);
                 }
                 self.index.insert(view, i);
                 i
@@ -1479,16 +1479,24 @@ pub(crate) fn forget(resource: usize) {
     };
     for i in entries {
         let (view, generation) = views.list[i as usize].clone();
-        // Entries freed through a view's other resource may hold another
-        // view by now.
+        // Only recycle an entry that still names this resource.
         if views.index.get(&view) != Some(&i) || !view.resources().contains(&resource) {
             continue;
         }
         views.index.remove(&view);
+        // A UAV may also name a counter that outlives its buffer (or the
+        // other way around). Do not leave its freed index in that resource's
+        // reverse index every time a view is recycled.
+        for other in view.resources().into_iter().filter(|&r| r != 0 && r != resource) {
+            if let std::collections::btree_map::Entry::Occupied(mut entries) = views.by_resource.entry(other) {
+                entries.get_mut().remove(&i);
+                if entries.get().is_empty() {
+                    entries.remove();
+                }
+            }
+        }
         // (Below the bits that say a record is no table entry.)
         views.list[i as usize].1 = ((generation + 1) & GENERATIONS).max(1);
-        // The view's other resource (a counter) keeps a stale entry, which
-        // `forget` of that resource skips.
         views.free.push(i);
     }
 }
@@ -2131,6 +2139,51 @@ mod tests {
         // SAFETY: both slots are in `slots`.
         let (old, new) = unsafe { (*(a as *const [u32; 3]), *(b as *const [u32; 3])) };
         assert_ne!(old, new, "a new generation");
+    }
+
+    /// Recycling views must not grow the reverse index of a long-lived counter.
+    #[test]
+    fn shared_counters_do_not_retain_released_view_backlinks() {
+        let counter = 0x7eed_0000usize;
+        let kept = counter + 0x100;
+        let stable = View::Unordered(kept, counter, None);
+        let [kept_index, kept_generation] = words_for(stable.clone());
+        for n in 1..=1024 {
+            let resource = counter + 0x1000 + n * 0x100;
+            let [index, generation] = words_for(View::Unordered(resource, counter, None));
+            forget(resource);
+            assert_eq!(view_at(index, generation), None, "released views go stale");
+        }
+        let backlinks = VIEWS.lock().unwrap().by_resource.get(&counter).map_or(0, |entries| entries.len());
+        assert_eq!(view_at(kept_index, kept_generation), Some(stable));
+        forget(counter);
+        assert_eq!(view_at(kept_index, kept_generation), None);
+        let kept_backlinks = VIEWS.lock().unwrap().by_resource.get(&kept).map_or(0, |entries| entries.len());
+        forget(kept);
+        assert_eq!(backlinks, 1, "only the surviving view names the counter");
+        assert_eq!(kept_backlinks, 0, "the last view leaves no reverse index");
+    }
+
+    #[test]
+    fn released_counters_remove_only_their_own_view_backlinks() {
+        let resource = 0x6eef_0000usize;
+        let counter = resource + 0x100;
+        let shader = View::Shader(resource, None);
+        let [shader_index, shader_generation] = words_for(shader.clone());
+        let [uav_index, uav_generation] = words_for(View::Unordered(resource, counter, None));
+        forget(counter);
+        let backlinks = VIEWS.lock().unwrap().by_resource.get(&resource).map_or(0, |entries| entries.len());
+        assert_eq!(view_at(uav_index, uav_generation), None);
+        assert_eq!(view_at(shader_index, shader_generation), Some(shader));
+        forget(resource);
+        assert_eq!(backlinks, 1, "the shader view is the only surviving backlink");
+
+        // Naming the same object as the buffer and its counter still frees one entry.
+        let [index, generation] = words_for(View::Unordered(resource, resource, None));
+        forget(resource);
+        assert_eq!(view_at(index, generation), None);
+        let views = VIEWS.lock().unwrap();
+        assert!(!views.by_resource.contains_key(&resource));
     }
 
     /// The title places its shader-visible heap in its own memory
