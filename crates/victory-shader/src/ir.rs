@@ -721,6 +721,308 @@ pub(crate) fn thread_edges(
     Ok(rename(blocks, p.wave64, p.vgprs))
 }
 
+/// The values among the blocks `within` that hold no set bit when those blocks run with no
+/// lane left (EXEC, as `entry`, empty): EXEC itself and lane compares, and what moves, ANDs,
+/// AND-NOTs of them and ORs of two of them make (the largest such set: a loop's mask stays
+/// empty round the loop).
+fn empty_with_no_lane(p: &Program, within: &[bool], entry: &[Value]) -> std::collections::HashSet<Value> {
+    let mut empty: std::collections::HashSet<Value> = entry.iter().copied().collect();
+    let inside = || p.blocks.iter().enumerate().filter(|(x, _)| within[*x]).map(|(_, b)| b);
+    for block in inside() {
+        empty.extend(block.phis.iter().map(|phi| phi.value));
+        empty.extend(block.insts.iter().flat_map(|i| i.writes.iter().map(|w| w.1)));
+    }
+    let holds = |empty: &std::collections::HashSet<Value>, i: &Inst, w: Reg| -> bool {
+        let read_empty = |regs: Vec<Reg>| {
+            let vals: Vec<Option<Value>> = regs.into_iter().map(|r| i.read(r)).collect();
+            !vals.is_empty() && vals.iter().all(|v| v.is_some_and(|v| empty.contains(&v)))
+        };
+        let exec_empty =
+            read_empty([Reg::S(EXEC), Reg::S(EXEC + 1)].into_iter().filter(|&r| i.read(r).is_some()).collect());
+        let op_empty = |o: &Operand| match *o {
+            Operand::Scalar { code, dwords } => {
+                read_empty((0..dwords).filter_map(|k| code.checked_add(k)).map(Reg::S).collect())
+            }
+            Operand::Const(128) => true,
+            _ => false,
+        };
+        let name = i.name();
+        if name.starts_with("v_cmp") {
+            return exec_empty;
+        }
+        let Fields::Sop { src, .. } = &i.fields else {
+            return false;
+        };
+        let new_exec = matches!(w, Reg::S(c) if c == EXEC || c == EXEC + 1) || w == Reg::Scc;
+        let src0 = src.first().is_some_and(op_empty);
+        let src1 = src.get(1).is_some_and(op_empty);
+        match name {
+            "s_mov_b32" | "s_mov_b64" => src0,
+            "s_and_b32" | "s_and_b64" => src0 || src1,
+            "s_andn2_b32" | "s_andn2_b64" => src0,
+            "s_or_b32" | "s_or_b64" => src0 && src1,
+            // EXEC (and SCC) = S0 & EXEC; the destination: the EXEC before
+            "s_and_saveexec_b32" | "s_and_saveexec_b64" => exec_empty || new_exec && src0,
+            // EXEC (and SCC) = S0 & ~EXEC; the destination: the EXEC before
+            "s_andn2_saveexec_b32" | "s_andn2_saveexec_b64" => {
+                if new_exec {
+                    src0
+                } else {
+                    exec_empty
+                }
+            }
+            // EXEC = the destination = SCC = S0 & ~EXEC
+            "s_andn2_wrexec_b32" | "s_andn2_wrexec_b64" => src0,
+            _ => false,
+        }
+    };
+    loop {
+        let before = empty.len();
+        for block in inside() {
+            for phi in &block.phis {
+                if empty.contains(&phi.value) && !phi.args.iter().all(|a| empty.contains(a)) {
+                    empty.remove(&phi.value);
+                }
+            }
+            for i in &block.insts {
+                for w in &i.writes {
+                    if empty.contains(&w.1) && !entry.contains(&w.1) && !holds(&empty, i, w.0) {
+                        empty.remove(&w.1);
+                    }
+                }
+            }
+        }
+        if empty.len() == before {
+            return empty;
+        }
+    }
+}
+
+/// The loops of the graph `succ` among the blocks `on`: its strongly connected parts that hold
+/// a cycle, each as the blocks in it.
+fn loops(succ: &[Vec<usize>], on: &[bool]) -> Vec<Vec<bool>> {
+    let n = succ.len();
+    let mut order = Vec::new();
+    let mut seen = vec![false; n];
+    for first in (0..n).filter(|&x| on[x]) {
+        if seen[first] {
+            continue;
+        }
+        seen[first] = true;
+        let mut stack = vec![(first, 0usize)];
+        while let Some(&(x, k)) = stack.last() {
+            if let Some(&y) = succ[x].get(k) {
+                stack.last_mut().expect("a block").1 += 1;
+                if on[y] && !seen[y] {
+                    seen[y] = true;
+                    stack.push((y, 0));
+                }
+            } else {
+                order.push(x);
+                stack.pop();
+            }
+        }
+    }
+    let mut preds = vec![Vec::new(); n];
+    for x in (0..n).filter(|&x| on[x]) {
+        for &y in succ[x].iter().filter(|&&y| on[y]) {
+            preds[y].push(x);
+        }
+    }
+    let mut part = vec![usize::MAX; n];
+    let mut parts = Vec::new();
+    for &first in order.iter().rev() {
+        if part[first] != usize::MAX {
+            continue;
+        }
+        let id = parts.len();
+        let mut members = vec![false; n];
+        let mut stack = vec![first];
+        part[first] = id;
+        while let Some(x) = stack.pop() {
+            members[x] = true;
+            for &y in &preds[x] {
+                if part[y] == usize::MAX {
+                    part[y] = id;
+                    stack.push(y);
+                }
+            }
+        }
+        let cycle = members.iter().filter(|&&m| m).count() > 1 || succ[first].contains(&first);
+        if cycle {
+            parts.push(members);
+        }
+    }
+    parts
+}
+
+/// Whether the loop `part` (blocks among `within`, which run with no lane left: EXEC `entry`;
+/// its edges `succ`) counts its way out. Its counts are scalars the lanes do not make:
+/// constants, values from before the blocks `within` (EXEC excepted), and scalar arithmetic on
+/// them, joined only where the loop chooses (in it, with one value from outside it). A test of
+/// a count is an ordered compare (a count passes its bound and stays past it), or an equality
+/// of counts made from constants alone: a count to a bound from before the blocks may pass it
+/// unseen when that bound is one the console never enters them with (0, with no lane left).
+/// Every branch in the loop tests a count; or, if some branch tests the lanes, no join in it
+/// chooses at all, and no way round it misses a test of a count that can leave it.
+fn as_on_console(p: &Program, within: &[bool], entry: &[Value], part: &[bool], succ: &[Vec<usize>]) -> bool {
+    use std::collections::{HashMap, HashSet};
+    let mut made: HashMap<Value, &Inst> = HashMap::new();
+    let mut joins: HashMap<Value, (usize, &Phi)> = HashMap::new();
+    for (x, block) in p.blocks.iter().enumerate().filter(|(x, _)| within[*x]) {
+        joins.extend(block.phis.iter().map(|phi| (phi.value, (x, phi))));
+        made.extend(block.insts.iter().flat_map(|i| i.writes.iter().map(move |w| (w.1, i))));
+    }
+    let arithmetic = |name: &str| {
+        [
+            "s_mov_b32", "s_mov_b64", "s_movk_i32", "s_cmov_b32", "s_cmovk_i32", "s_cselect_b32", "s_cselect_b64",
+            "s_add_u32", "s_add_i32", "s_addk_i32", "s_sub_u32", "s_sub_i32", "s_addc_u32", "s_subb_u32",
+            "s_mul_i32", "s_mulk_i32", "s_min_i32", "s_min_u32", "s_max_i32", "s_max_u32", "s_abs_i32",
+            "s_lshl_b32", "s_lshl_b64", "s_lshr_b32", "s_lshr_b64", "s_ashr_i32", "s_ashr_i64",
+            "s_lshl1_add_u32", "s_lshl2_add_u32", "s_lshl3_add_u32", "s_lshl4_add_u32",
+            "s_and_b32", "s_and_b64", "s_or_b32", "s_or_b64", "s_xor_b32", "s_xor_b64", "s_andn2_b32",
+            "s_andn2_b64", "s_orn2_b32", "s_orn2_b64", "s_not_b32", "s_not_b64", "s_bfe_u32", "s_bfe_i32",
+            "s_bfm_b32", "s_sext_i32_i8", "s_sext_i32_i16",
+        ]
+        .contains(&name)
+            || name.starts_with("s_cmp_")
+            || name.starts_with("s_cmpk_")
+    };
+    let made_here = |v: &Value| made.contains_key(v) || joins.contains_key(v);
+    let one = |vals: &mut dyn Iterator<Item = Value>| {
+        let vals: Vec<Value> = vals.collect();
+        vals.windows(2).all(|w| w[0] == w[1])
+    };
+    // the counts; `fixed`: no join in the loop chooses between two values either
+    // `constant`: counts made from constants alone
+    let counts = |fixed: bool, constant: bool| -> HashSet<Value> {
+        let mut same: HashSet<Value> = made.keys().chain(joins.keys()).copied().collect();
+        loop {
+            let before = same.len();
+            let console = |v: &Value| if made_here(v) { same.contains(v) } else { !constant && !entry.contains(v) };
+            let gone: Vec<Value> = same
+                .iter()
+                .copied()
+                .filter(|v| {
+                    let holds = if let Some(&(x, phi)) = joins.get(v) {
+                        let ways = || p.blocks[x].preds.iter().zip(&phi.args);
+                        let one_way = if part[x] {
+                            one(&mut ways().filter(|(q, _)| !part[**q]).map(|(_, a)| *a))
+                                && (!fixed || one(&mut ways().filter(|(q, _)| part[**q]).map(|(_, a)| *a)))
+                        } else {
+                            one(&mut phi.args.iter().copied())
+                        };
+                        one_way && phi.args.iter().all(console)
+                    } else {
+                        let i = made[v];
+                        matches!(i.fields, Fields::Sop { .. })
+                            && arithmetic(i.name())
+                            && i.reads
+                                .iter()
+                                .all(|r| !matches!(r.0, Reg::S(c) if c == EXEC || c == EXEC + 1) && console(&r.1))
+                    };
+                    !holds
+                })
+                .collect();
+            for v in gone {
+                same.remove(&v);
+            }
+            if same.len() == before {
+                return same;
+            }
+        }
+    };
+    let tests_a_count = |(same, constants): &(HashSet<Value>, HashSet<Value>), x: usize| {
+        let ordered = |v: &Value| {
+            made.get(v).is_some_and(|i| ["_lt_", "_le_", "_gt_", "_ge_"].iter().any(|o| i.name().contains(o)))
+        };
+        matches!(p.blocks[x].exit, Exit::Branch { .. })
+            && p.blocks[x].insts.last().is_some_and(|i| {
+                matches!(i.name(), "s_cbranch_scc0" | "s_cbranch_scc1")
+                    && i.read(Reg::Scc).is_some_and(|v| constants.contains(&v) || ordered(&v) && same.contains(&v))
+            })
+    };
+    let blocks: Vec<usize> = (0..p.blocks.len()).filter(|&x| part[x]).collect();
+    if blocks.iter().any(|&x| matches!(p.blocks[x].exit, Exit::End | Exit::Indirect)) {
+        return false;
+    }
+    let branches = || blocks.iter().copied().filter(|&x| matches!(p.blocks[x].exit, Exit::Branch { .. }));
+    let free = (counts(false, false), counts(false, true));
+    if branches().all(|x| tests_a_count(&free, x)) {
+        return true;
+    }
+    let fixed = (counts(true, false), counts(true, true));
+    let leaves = |x: usize| succ[x].iter().any(|&y| !part[y]);
+    let tested: Vec<bool> =
+        (0..p.blocks.len()).map(|x| part[x] && tests_a_count(&fixed, x) && leaves(x)).collect();
+    let untested: Vec<bool> = (0..p.blocks.len()).map(|x| part[x] && !tested[x]).collect();
+    tested.iter().any(|&t| t) && loops(succ, &untested).is_empty()
+}
+
+/// The blocks reached from `first`.
+fn reached_from(p: &Program, first: usize) -> Vec<bool> {
+    let mut on = vec![false; p.blocks.len()];
+    let mut stack = vec![first];
+    while let Some(x) = stack.pop() {
+        if !on[x] {
+            on[x] = true;
+            stack.extend(p.blocks[x].exit.successors());
+        }
+    }
+    on
+}
+
+/// EXEC as the `s_cbranch_execz` that ends block `b` tests it.
+fn tested_exec(p: &Program, b: usize) -> Vec<Value> {
+    let i = p.blocks[b].insts.last().expect("a branch");
+    i.reads.iter().filter(|r| matches!(r.0, Reg::S(c) if c == EXEC || c == EXEC + 1)).map(|r| r.1).collect()
+}
+
+/// Whether the blocks `within`, entered at `first` with no lane left (EXEC `entry`), hold a
+/// loop that may not end there. The console never runs them so: it skips them, or leaves the
+/// program, when no lane is left. A loop until some lane's compare holds then never ends, and
+/// every lane walks it to the iteration limit (with any group barriers in it, every time
+/// round). A branch on a mask that is empty with no lane left (EXEC, a lane compare, a
+/// waterfall over the bits of either) goes one known way. A loop that counts its way out goes
+/// round as it would on the console ([`as_on_console`]). Any other branch can go either way, a
+/// skip on EXEC too: this or a later form may leave it out.
+fn goes_round(p: &Program, first: usize, within: &[bool], entry: &[Value]) -> bool {
+    let n = p.blocks.len();
+    let empty = empty_with_no_lane(p, within, entry);
+    let all_empty = |i: &Inst, regs: &[Reg]| {
+        let vals: Vec<Value> = i.reads.iter().filter(|r| regs.contains(&r.0)).map(|r| r.1).collect();
+        !vals.is_empty() && vals.iter().all(|v| empty.contains(v))
+    };
+    let ways = |x: usize| -> Vec<usize> {
+        let Exit::Branch { taken, not_taken } = p.blocks[x].exit else {
+            return p.blocks[x].exit.successors();
+        };
+        let Some(i) = p.blocks[x].insts.last() else {
+            return vec![taken, not_taken];
+        };
+        let (exec, vcc) = ([Reg::S(EXEC), Reg::S(EXEC + 1)], [Reg::S(VCC), Reg::S(VCC + 1)]);
+        match i.name() {
+            "s_cbranch_execnz" if all_empty(i, &exec) => vec![not_taken],
+            "s_cbranch_vccz" if all_empty(i, &vcc) => vec![taken],
+            "s_cbranch_vccnz" if all_empty(i, &vcc) => vec![not_taken],
+            "s_cbranch_scc0" if all_empty(i, &[Reg::Scc]) => vec![taken],
+            "s_cbranch_scc1" if all_empty(i, &[Reg::Scc]) => vec![not_taken],
+            _ => vec![taken, not_taken],
+        }
+    };
+    let mut reached = vec![false; n];
+    let mut stack = vec![first];
+    while let Some(x) = stack.pop() {
+        if within[x] && !reached[x] {
+            reached[x] = true;
+            stack.extend(ways(x));
+        }
+    }
+    // a loop among the blocks reached that does not go round as it does on the console
+    let succ: Vec<Vec<usize>> = (0..n).map(|x| if reached[x] { ways(x) } else { Vec::new() }).collect();
+    loops(&succ, &reached).iter().any(|part| !as_on_console(p, within, entry, part, &succ))
+}
+
 /// The program without its early-outs: an `s_cbranch_execz` to a block that
 /// only ends the program (`if (!inBounds) return;`, the outermost branch of
 /// most compute programs) is left out, so the lanes that would have left
@@ -774,16 +1076,20 @@ fn far_jump_to_end(p: &Program, b: usize) -> bool {
 /// Where the lanes that stay go when block `b` ends in an early-out: `s_cbranch_execz` to a
 /// block that only ends the program, or `s_cbranch_execnz` whose other way is a far jump to
 /// such a block (a program too long for the branch to reach its end). The branch is then
-/// left out and the code goes on there.
+/// left out and the code goes on there, unless the code after it holds a loop that may not
+/// end with no lane left.
 fn early_out_continuation(p: &Program, b: usize) -> Option<usize> {
     let Exit::Branch { taken, not_taken } = p.blocks[b].exit else {
         return None;
     };
-    match p.blocks[b].insts.last()?.name() {
-        "s_cbranch_execz" if ends_program(p, taken) => Some(not_taken),
-        "s_cbranch_execnz" if far_jump_to_end(p, not_taken) => Some(taken),
-        _ => None,
-    }
+    let next = match p.blocks[b].insts.last()?.name() {
+        "s_cbranch_execz" if ends_program(p, taken) => not_taken,
+        "s_cbranch_execnz" if far_jump_to_end(p, not_taken) => taken,
+        _ => return None,
+    };
+    // The rest of the program then runs with no lane left: not where it holds a loop that may
+    // not end there ([`goes_round`]; fxceless/victory-fork#262).
+    (!goes_round(p, next, &reached_from(p, next), &tested_exec(p, b))).then_some(next)
 }
 
 /// As [`without_early_outs`], and also without the branches that only skip a
@@ -807,6 +1113,9 @@ fn early_out_continuation(p: &Program, b: usize) -> Option<usize> {
 /// outer one).
 /// That leaves out most of the skips of the title's large lighting programs, whose bodies
 /// are then code every lane runs.
+///
+/// A skip, like an early-out, is kept when the region holds a loop that may not end with no
+/// lane left ([`goes_round`]).
 pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
     let n = p.blocks.len();
     // Scalars moved from register to register (a scalar the compiler parked in a VGPR lane
@@ -933,6 +1242,10 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
             if p.blocks[x].preds.iter().any(|&q| q != b && !inside[q]) {
                 return None;
             }
+        }
+        // no loop it can go round with no lane left
+        if goes_round(p, first, &inside, &tested_exec(p, b)) {
+            return None;
         }
         // the join sees no scalar the region changed
         let join = &p.blocks[target];
@@ -1934,6 +2247,208 @@ mod tests {
         assert!(without_skips(&program(ENTRY, &[0x7E04_0206]), true).is_none());
         // read after EXEC changed again (s_mov_b64 exec, s[40:41]): kept
         assert!(without_skips(&program(ENTRY, &[0xBEFE_0428, LOAD, LOAD1]), true).is_none());
+    }
+
+    /// A region with a loop in it keeps its skip, whatever the scalars after the join: the
+    /// console never runs it with no lane left, and there its exit may never come (a loop
+    /// until some lane's compare holds; a waterfall over the set bits of a lane mask that is
+    /// empty then), so every lane would walk it to the iteration limit.
+    #[test]
+    fn a_skip_around_a_loop_is_kept() {
+        let looped = skip(
+            &[
+                0xBE95_0380, // s_mov_b32 s21, 0
+                0x7D84_0015, // v_cmp_eq_u32 vcc, s21, v0
+                0x8015_8115, // s_add_u32 s21, s21, 1
+                0xBF86_FFFD, // s_cbranch_vccz (back to the compare)
+            ],
+            &[],
+        );
+        assert_eq!(skips(&looped), 1);
+        assert!(without_skips(&looped, false).is_none());
+        assert!(without_skips(&looped, true).is_none());
+    }
+
+    /// The loop is behind a skip of its own: that one may be left out too (by this or a later
+    /// form), so the skip around both is kept as well.
+    #[test]
+    fn a_skip_around_a_skipped_loop_is_kept() {
+        let nested = skip(
+            &[
+                0x7D88_0001, // v_cmp_gt_u32 vcc, s1, v0
+                0xBE8E_246A, // s_and_saveexec_b64 s[14:15], vcc
+                0xBF88_0004, // s_cbranch_execz past the loop
+                0xBE95_0380, // s_mov_b32 s21, 0
+                0x7D84_0015, // v_cmp_eq_u32 vcc, s21, v0
+                0x8015_8115, // s_add_u32 s21, s21, 1
+                0xBF86_FFFD, // s_cbranch_vccz (back to the compare)
+                0xBEFE_040E, // s_mov_b64 exec, s[14:15]
+            ],
+            &[],
+        );
+        assert_eq!(skips(&nested), 2);
+        assert!(without_skips(&nested, false).is_none());
+        assert!(without_skips(&nested, true).is_none());
+    }
+
+    /// A skip to the end of the program is kept when the rest holds such a loop.
+    #[test]
+    fn an_early_out_before_a_loop_is_kept() {
+        let p = build_words(
+            &[
+                0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+                0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+                0xBF88_0004, // s_cbranch_execz to the end
+                0xBE95_0380, // s_mov_b32 s21, 0
+                0x7D84_0015, // v_cmp_eq_u32 vcc, s21, v0
+                0x8015_8115, // s_add_u32 s21, s21, 1
+                0xBF86_FFFD, // s_cbranch_vccz (back to the compare)
+                S_ENDPGM,
+            ],
+            true,
+        );
+        assert_eq!(skips(&p), 1);
+        assert!(without_early_outs(&p).is_none());
+        assert!(without_skips(&p, false).is_none());
+        assert!(without_skips(&p, true).is_none());
+    }
+
+    /// A loop that ends when no lane is left (EXEC tested at its back edge) ends at once in a
+    /// region with no lane left: the skip around it is left out.
+    #[test]
+    fn a_skip_around_a_loop_that_ends_with_its_lanes_is_left_out() {
+        let looped = skip(
+            &[
+                0x4A02_0281, // v_add_nc_u32 v1, 1, v1
+                0x7DA8_0284, // v_cmpx_gt_u32 4, v1
+                0xBF89_FFFD, // s_cbranch_execnz (back to the add)
+            ],
+            &[],
+        );
+        assert_eq!(skips(&looped), 1);
+        for deep in [false, true] {
+            assert_eq!(skips(&without_skips(&looped, deep).expect("left out")), 0);
+        }
+    }
+
+    /// A waterfall over the bits of a mask taken from EXEC (SCC of the AND-NOT at its back
+    /// edge) ends at once too: the mask is empty with no lane left.
+    #[test]
+    fn a_skip_around_a_waterfall_over_exec_is_left_out() {
+        let looped = skip(
+            &[
+                0xBE90_047E, // s_mov_b64 s[16:17], exec
+                0x8A90_1210, // s_andn2_b64 s[16:17], s[16:17], s[18:19]
+                0xBF85_FFFE, // s_cbranch_scc1 (back to the AND-NOT)
+            ],
+            &[],
+        );
+        assert_eq!(skips(&looped), 1);
+        assert_eq!(skips(&without_skips(&looped, true).expect("left out")), 0);
+    }
+
+    /// A loop that counts its way out (a scalar from a constant, its bound a constant) goes
+    /// round as on the console with no lane left, and ends: the skip around it is left out.
+    #[test]
+    fn a_skip_around_a_counted_loop_is_left_out() {
+        let looped = skip(
+            &[
+                0xBE95_0380, // s_mov_b32 s21, 0
+                0x4A02_0281, // v_add_nc_u32 v1, 1, v1
+                0x8015_8115, // s_add_u32 s21, s21, 1
+                0xBF0A_8415, // s_cmp_lt_u32 s21, 4
+                0xBF85_FFFC, // s_cbranch_scc1 (back to the add)
+            ],
+            &[],
+        );
+        assert_eq!(skips(&looped), 1);
+        assert_eq!(skips(&without_skips(&looped, true).expect("left out")), 0);
+    }
+
+    /// A counted loop with a skip on EXEC inside still counts its way out: the skip around it
+    /// is left out. A join in it that the lanes choose (the count goes up on one side only)
+    /// keeps it.
+    #[test]
+    fn a_skip_around_a_counted_loop_with_a_lane_branch_in_it() {
+        let counted = |inner: u32| {
+            skip(
+                &[
+                    0xBE95_0380, // s_mov_b32 s21, 0
+                    0x7D88_0001, // v_cmp_gt_u32 vcc, s1, v0
+                    0xBE8E_246A, // s_and_saveexec_b64 s[14:15], vcc
+                    0xBF88_0001, // s_cbranch_execz past the next
+                    inner,       // the lanes' work, or a count of their own
+                    0xBEFE_040E, // s_mov_b64 exec, s[14:15]
+                    0x8015_8115, // s_add_u32 s21, s21, 1
+                    0xBF0A_8415, // s_cmp_lt_u32 s21, 4
+                    0xBF85_FFF8, // s_cbranch_scc1 (back to the compare)
+                ],
+                &[],
+            )
+        };
+        let lanes = counted(0x4A02_0281); // v_add_nc_u32 v1, 1, v1
+        assert_eq!(skips(&lanes), 2);
+        let left = without_skips(&lanes, true).expect("left out");
+        assert_eq!(skips(&left), 0);
+        let chosen = counted(0x8015_8115); // s_add_u32 s21, s21, 1
+        assert_eq!(skips(&chosen), 2);
+        assert!(without_skips(&chosen, true).is_none());
+    }
+
+    /// H1 (review): a count test on the way round that cannot leave the loop does not make it
+    /// end; the loop's way out is a lane compare, empty with no lane left. The skip is kept.
+    #[test]
+    fn a_skip_around_a_loop_whose_count_cannot_leave_it_is_kept() {
+        let looped = skip(
+            &[
+                0xBE95_0380, // s_mov_b32 s21, 0
+                0x7D84_0015, // v_cmp_eq_u32 vcc, s21, v0
+                0x8015_8115, // s_add_u32 s21, s21, 1
+                0xBF0A_8415, // s_cmp_lt_u32 s21, 4
+                0xBF85_0001, // s_cbranch_scc1 past the next
+                0x4A02_0281, // v_add_nc_u32 v1, 1, v1
+                0xBF86_FFFA, // s_cbranch_vccz (back to the compare)
+            ],
+            &[],
+        );
+        assert_eq!(skips(&looped), 1);
+        assert!(without_skips(&looped, false).is_none());
+        assert!(without_skips(&looped, true).is_none());
+    }
+
+    /// H2 (review): `if (v0 < s0) { i = 0; do { .. } while (++i != s0); }`. With no lane left s0
+    /// may be 0, and the count passes it. The skip is kept.
+    #[test]
+    fn a_skip_around_a_count_to_a_bound_it_may_pass_is_kept() {
+        let looped = skip(
+            &[
+                0xBE95_0380, // s_mov_b32 s21, 0
+                0x4A02_0281, // v_add_nc_u32 v1, 1, v1
+                0x8015_8115, // s_add_u32 s21, s21, 1
+                0xBF07_0015, // s_cmp_lg_u32 s21, s0
+                0xBF85_FFFC, // s_cbranch_scc1 (back to the add)
+            ],
+            &[],
+        );
+        assert_eq!(skips(&looped), 1);
+        assert!(without_skips(&looped, false).is_none());
+        assert!(without_skips(&looped, true).is_none());
+    }
+
+    /// A loop on a scalar read from a lane (none with no lane left) keeps its skip.
+    #[test]
+    fn a_skip_around_a_loop_on_a_lane_read_is_kept() {
+        let looped = skip(
+            &[
+                0x7E2A_0501, // v_readfirstlane_b32 s21, v1
+                0xBF0A_8415, // s_cmp_lt_u32 s21, 4
+                0xBF85_FFFD, // s_cbranch_scc1 (back to the read)
+            ],
+            &[],
+        );
+        assert_eq!(skips(&looped), 1);
+        assert!(without_skips(&looped, false).is_none());
+        assert!(without_skips(&looped, true).is_none());
     }
 
     #[test]
