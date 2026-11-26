@@ -508,10 +508,14 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
 
 #[cfg(all(windows, feature = "diagnostics"))]
 fn skipped_shader(p: &Pipeline) -> Option<&str> {
-    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    // LOCAL: a set, not a list. Every draw and dispatch asks this for each
+    // of its shaders; with the 1,034 hashes of `scripts/rt_off_hashes.txt` a
+    // list was some 20 million string compares a frame, a sixth of the
+    // recording threads' time (profile of 2026-11-26).
+    static HASHES: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
-        parse_skip_hashes(&value)
+        parse_skip_hashes(&value).into_iter().collect()
     });
     if hashes.is_empty() {
         return None;
