@@ -5696,7 +5696,16 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let (buffer, data) = match reused {
         Some((buffer, data)) => {
             EXACT_STATS[4].fetch_add(1, Ordering::Relaxed);
-            (buffer, data as *mut u8)
+            EXACT_POOL_BYTES.fetch_sub(size, Ordering::Relaxed);
+            let data = data as *mut u8;
+            // The bytes past the view, up to the 256-byte size, as on a
+            // buffer made anew: zeros (the copy's refreshes write the rest).
+            // SAFETY: the buffer is mapped and `size` bytes long; nothing
+            // else holds it.
+            unsafe { std::ptr::write_bytes(data.add(len as usize), 0, (size - len) as usize) };
+            #[cfg(feature = "diagnostics")]
+            crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
+            (buffer, data)
         }
         None => {
             let (buffer, data) = host()?.shared_buffer(size)?;
@@ -5732,6 +5741,13 @@ static EXACT_POOL: Mutex<BTreeMap<u64, Vec<(ID3D12Resource, usize)>>> = Mutex::n
 /// Buffers kept in [`EXACT_POOL`] at most.
 const EXACT_POOL_MOST: usize = 4096;
 
+/// Their bytes at most: a copy may be up to 64 MiB, and these stay mapped
+/// in the PC's memory.
+const EXACT_POOL_MOST_BYTES: u64 = 128 << 20;
+
+/// Bytes of the buffers in [`EXACT_POOL`].
+static EXACT_POOL_BYTES: AtomicU64 = AtomicU64::new(0);
+
 /// Keeps the buffers of copies let go that nothing else holds: no list
 /// (the copy was the map's alone) and no slot (the buffer was the copy's
 /// alone), which is when they were let go before. A copy made on one starts
@@ -5751,9 +5767,15 @@ fn keep_buffers(gone: Vec<(Arc<Shadow>, u64)>) {
     if kept.is_empty() {
         return;
     }
+    // The small ones first: past either limit the largest are let go.
+    kept.sort_unstable_by_key(|k| k.0);
     let mut pool = EXACT_POOL.lock().unwrap_or_else(|e| e.into_inner());
     let room = EXACT_POOL_MOST.saturating_sub(pool.values().map(Vec::len).sum());
     for (size, buffer, data) in kept.into_iter().take(room) {
+        if EXACT_POOL_BYTES.load(Ordering::Relaxed) + size > EXACT_POOL_MOST_BYTES {
+            break;
+        }
+        EXACT_POOL_BYTES.fetch_add(size, Ordering::Relaxed);
         pool.entry(size).or_default().push((buffer, data));
     }
 }
@@ -5770,13 +5792,16 @@ pub(crate) fn exact_line(frames: f64) {
         return;
     }
     let kept = EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.len();
+    let pooled = EXACT_POOL.lock().unwrap_or_else(|e| e.into_inner()).values().map(Vec::len).sum::<usize>();
     tracing::info!(
         "buffer views off their copy's elements (they were refused and read zeros; VICTORY_VIEW_BYTES=0 refuses them again): \
-         {:.1} asked for per frame, {:.1} copies of their own bytes made per frame ({:.1} on a buffer let go), {kept} kept; \
-         {:.1} ms a frame waiting for their lock, {:.1} ms making them (all threads)",
+         {:.1} asked for per frame, {:.1} copies of their own bytes made per frame ({:.1} on a buffer let go), {kept} kept, \
+         {pooled} buffers ({:.1} MB) kept for reuse; {:.1} ms a frame waiting for their lock, {:.1} ms a frame between it and \
+         the next (dropping copies let go, the pool's lock, making or taking a buffer; all threads)",
         asked as f64 / frames,
         made as f64 / frames,
         reused as f64 / frames,
+        EXACT_POOL_BYTES.load(Ordering::Relaxed) as f64 / f64::from(1 << 20),
         waited as f64 / 1e6 / frames,
         making as f64 / 1e6 / frames
     );
@@ -5975,7 +6000,7 @@ pub(crate) fn near(va: u64) -> String {
 
 #[cfg(test)]
 mod exact_tests {
-    use super::{EXACT, exact};
+    use super::{EXACT, EXACT_POOL_BYTES, EXACT_POOL_MOST_BYTES, exact};
 
     /// The copies of title memory at `[start, start + span)` that [`exact`] keeps.
     fn kept(start: u64, span: u64) -> usize {
@@ -6010,6 +6035,8 @@ mod exact_tests {
         let after = kept(start, span);
         assert!(after < before, "idle copies are let go ({before} -> {after})");
         assert!(kept(start, 4 * 300) < 300, "the 300 copies once held went");
+        let pooled = EXACT_POOL_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(pooled <= EXACT_POOL_MOST_BYTES, "buffers kept for reuse stay under the cap ({pooled})");
         drop(memory);
     }
 }
