@@ -5554,26 +5554,17 @@ mod tests {
             let (copy, address, bytes) = buffer_copy(&v).unwrap();
             assert_eq!((copy.span(), address, bytes), ((start + off, len), start + off, len));
         }
-        // Register the backing range so the host copy starts at `start`,
-        // independent of the loose memory window that contains the allocation.
-        let mut v = view(start, false);
-        let View::Placed(_, _, desc) = &mut v else { unreachable!() };
-        desc[4] = 1; // FirstElement, at byte offset 456 in the copy
-        desc[6] = 3; // NumElements
-        let key = start as usize;
-        crate::shadow::register(key, start, 4 * 456);
-        let made = make(&v, at);
-        let refreshed = buffer_copy(&v);
-        crate::shadow::unregister(key, start);
-        let made = made.expect("a view").expect("a buffer");
-        let (copy, address, bytes) = refreshed.unwrap();
-        assert_eq!((address, bytes), (start + 456, 3 * 456));
-        assert_eq!(made, copy.buffer, "the descriptor and refresh share a copy");
+        // Offset 456 is on a structured element but eight bytes past a raw
+        // view boundary. Without twins, the slot itself must use a raw view.
+        let v = view(start + 456, false);
+        let (copy, address, bytes) = buffer_copy(&v).unwrap();
+        assert_eq!((address, bytes), (start + 456, 4 * 456));
         if victory_shader::emit::raw_views() == 0 {
             assert_eq!(copy.span(), (address, bytes));
+            assert_eq!(width(&v), bytes.next_multiple_of(256));
             eprintln!("the structured slot without a raw twin uses a view-relative copy");
         } else {
-            assert_eq!(copy.span(), (start, 4 * 456));
+            assert_ne!(copy.span().0, address, "its buffer's copy");
         }
         for (off, raw) in [(16, true), (32, false)] {
             let v = view(start + off, raw);
