@@ -5251,6 +5251,7 @@ mod tests {
         super::read_short(start);
         assert!(pending());
         super::read_all(start);
+    }
 
     /// The unsigned twin of a 16-bit float or signed format has its layout,
     /// and only buffer views in such a format are shown as another view.
