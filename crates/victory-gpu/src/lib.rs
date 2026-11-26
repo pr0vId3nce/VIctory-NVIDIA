@@ -79,6 +79,10 @@ mod residency;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
+mod stretch;
+#[cfg(all(windows, feature = "dlss"))]
+mod dlss;
+#[cfg(windows)]
 mod safecopy;
 #[cfg(windows)]
 mod sampler;
