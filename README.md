@@ -1,3 +1,25 @@
+# VIctory for NVIDIA
+
+This fork is an **NVIDIA (GeForce RTX) build** of
+[avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX),
+kept on top of its newest `main`. The branch `nvidia` adds what NVIDIA cards
+need, each change small and listed in the history:
+
+- PR #23 reverted on this branch: on NVIDIA it doubles frame time (avatarmanz
+  issue #221); a cheaper form is being worked on.
+- PR #48 merged: dynamic descriptor ranges return when their fence completes
+  (avatarmanz issue #35).
+- The low-memory pipeline-worker mode (#56).
+
+Tested on one PC: RTX 4080 16 GB, Ryzen 9 7900X, 32 GB RAM, Windows 11.
+
+**This repository contains no game files, code or assets.** You need your own
+copy. Not affiliated with or endorsed by any developer or publisher.
+
+The upstream README follows.
+
+---
+
 # VIctory on an RX 7900 XTX
 
 A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
