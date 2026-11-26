@@ -1070,6 +1070,11 @@ fn convertible(dst: This, src: This) -> Option<u32> {
         (None, Some(format)) => (format, dst),
         _ => return None,
     };
+    // Only the 16-bit colour formats: this tree also stands in RGBA16F for
+    // R9G9B9E5 (67), which the pass does not convert.
+    if !matches!(format, 86 | 115) {
+        return None;
+    }
     let host = crate::resource::host_resource(other)?;
     // SAFETY: a plain query of a live texture.
     (unsafe { host.GetDesc() }.Format.0 as u32 == format).then_some(format)
