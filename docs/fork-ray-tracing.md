@@ -98,6 +98,8 @@ after it was given them as an unordered access view.
 | `VICTORY_BVH_TRACE=1` | logs what sizes are asked, when they came, and the copies (diagnostics) |
 | `VICTORY_BVH_QUARANTINE=1` | nothing it stores comes back to title memory |
 | `VICTORY_MEMORY_CARD_MB` | the most of it on the card (4096) |
+| `VICTORY_MEMORY_CARD_ROOM=1` | with the builder on, it goes on the card only while the card is under 97 % of its budget (off: always, an arena in the PC's memory costs seconds of the card a frame) |
+| `VICTORY_CARD_ROOM_FOR_MEMORY_MB` | with the builder on, what the texture queue and the sweep of idle textures keep free of the card ahead of it (1024; 0: none) |
 | `VICTORY_MEMORY_DUMP=<folder>` | a file `go` there writes the arenas out (diagnostics) |
 | `VICTORY_UPLOAD_LOW=0`, `VICTORY_LENT_HEAP=0` | lists' upload memory above 2^40, no view heap for lists without one, as before |
 
