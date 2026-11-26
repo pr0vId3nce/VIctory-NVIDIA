@@ -5451,6 +5451,93 @@ pub(crate) fn small_buffer_in(address: u64, len: u64, most: u64) -> bool {
         .any(|(key, entry)| entry.end > address && entry.end - key.0 <= most)
 }
 
+/// The bytes of title memory by address ([`by_address`]) whose side for
+/// shaders is in the card's memory, and those whose side is in the PC's,
+/// since the start (arenas are kept for the run).
+static BY_ADDRESS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// [`BY_ADDRESS`], for the memory line.
+pub(crate) fn by_address_bytes() -> [u64; 2] {
+    [BY_ADDRESS[0].load(Ordering::Relaxed), BY_ADDRESS[1].load(Ordering::Relaxed)]
+}
+
+/// The most title memory by address has on the card's own memory: 4 GiB
+/// unless `VICTORY_MEMORY_CARD_MB` says otherwise.
+fn by_address_most() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        let mb = std::env::var("VICTORY_MEMORY_CARD_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
+        mb.unwrap_or(4096) << 20
+    })
+}
+
+/// [`memory_room_kept`]: nothing without the builder; else `head` MB (1,024
+/// unless said), and not more than memory by address may still take of the
+/// card (`most` less what it holds there).
+fn memory_room(builder: bool, head: Option<u64>, most: u64, on_card: u64) -> u64 {
+    if !builder {
+        return 0;
+    }
+    head.map_or(1024 << 20, |mb| mb.min(8192) << 20).min(most.saturating_sub(on_card))
+}
+
+/// The bytes of the card's memory the texture queue leaves free
+/// (`resource::room`) for title memory by address that is not made yet, with
+/// the ray-tracing structure builder asked for (`VICTORY_BVH_BUILDER=1`):
+/// `VICTORY_CARD_ROOM_FOR_MEMORY_MB` (1,024; 0: none, as before), kept ahead
+/// of the arenas as they come, until they hold all they may
+/// ([`by_address_most`]).
+///
+/// The builder's arenas come as structures stream in, after the texture
+/// queue has filled the card to its line and the world's targets and buffer
+/// copies have gone over it: an RTX 4080 (16 GB) stood at 99 % of its budget
+/// in Series S and 100 to 105 % in Series X, and [`by_address`] puts an
+/// arena that finds the card past 97 % in the PC's memory, where every store
+/// of the builder and every step of every ray goes over the bus. In Series X
+/// the card then stopped answering inside a builder dispatch some 70 s into
+/// the world, two runs of two (0x887A0006); since then an arena goes on the
+/// card whatever its budget ([`by_address`]), and this room is what keeps
+/// the card from going over it for them.
+///
+/// The room is kept ahead of the arenas, not all they may take: they came to
+/// 1.3 GB in Series S and 1.8 GB in Series X, and 3 GB kept from the start
+/// left the rest of it empty. The sweep of idle textures counts it as the
+/// queue does (`resource::let_go_idle`): kept from the queue alone, the
+/// queue was refused while the sweep saw a card with room and let nothing
+/// go, and 22,000 textures waited where 8,000 had (a window's mesh and the
+/// walls' textures among them).
+pub(crate) fn memory_room_kept() -> u64 {
+    static HEAD: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let head = *HEAD.get_or_init(|| {
+        std::env::var("VICTORY_CARD_ROOM_FOR_MEMORY_MB").ok().and_then(|v| v.trim().parse::<u64>().ok())
+    });
+    memory_room(crate::pipeline::builder_allowed(), head, by_address_most(), BY_ADDRESS[0].load(Ordering::Relaxed))
+}
+
+#[cfg(test)]
+mod memory_room_tests {
+    use super::memory_room;
+
+    #[test]
+    fn room_is_kept_ahead_of_memory_by_address_only_with_the_builder() {
+        const MOST: u64 = 4096 << 20;
+        // Without the builder nothing is kept, whatever is asked.
+        assert_eq!(memory_room(false, None, MOST, 0), 0);
+        assert_eq!(memory_room(false, Some(4096), MOST, 0), 0);
+        // With it: 1,024 MB unless said, whatever the card holds already,
+        assert_eq!(memory_room(true, None, MOST, 0), 1024 << 20);
+        assert_eq!(memory_room(true, None, MOST, 2048 << 20), 1024 << 20);
+        // until less than that is left of what memory by address may take.
+        assert_eq!(memory_room(true, None, MOST, 3584 << 20), 512 << 20);
+        assert_eq!(memory_room(true, None, MOST, MOST), 0);
+        assert_eq!(memory_room(true, None, MOST, MOST + (64 << 20)), 0);
+        // 0 turns it off; more than 8 GiB is not kept.
+        assert_eq!(memory_room(true, Some(0), MOST, 0), 0);
+        assert_eq!(memory_room(true, Some(2048), MOST, 64 << 20), 2048 << 20);
+        assert_eq!(memory_room(true, Some(1 << 20), 16384 << 20, 0), 8192 << 20);
+    }
+}
+
 /// A copy of the memory `[start, start + len)` (an arena of
 /// [`crate::memory`]'s, its directory, title memory around a small buffer)
 /// for the programs that find memory by address, on the card: the structures
@@ -5465,24 +5552,42 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         return None;
     }
     // At most so much on the card's own memory (4 GiB unless
-    // `VICTORY_MEMORY_CARD_MB` says otherwise), and while it has room; past
-    // that the side shaders see is in the PC's memory.
-    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    // `VICTORY_MEMORY_CARD_MB` says otherwise); past that the side shaders
+    // see is in the PC's memory. Whatever the card's budget says: an arena
+    // in the PC's memory costs every access of every shader the bus (448 MB
+    // of 1,873 there: 2.2 s of the card's time a frame where 0.3 s was, and
+    // with more the card stopped answering), and over its budget the system
+    // moves what was used least. `VICTORY_MEMORY_CARD_ROOM=1`: only while
+    // the card is under 97 % of its budget, as before.
     static USED: AtomicU64 = AtomicU64::new(0);
-    let most = *MOST.get_or_init(|| {
-        let mb = std::env::var("VICTORY_MEMORY_CARD_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
-        mb.unwrap_or(4096) << 20
-    });
-    let room = host.video_memory().is_none_or(|[budget, used, ..]| used + len < budget / 100 * 97);
+    let most = by_address_most();
+    static ROOM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let room = !*ROOM.get_or_init(|| std::env::var_os("VICTORY_MEMORY_CARD_ROOM").is_some_and(|v| v == "1"))
+        || host.video_memory().is_none_or(|[budget, used, ..]| used + len < budget / 100 * 97);
     let (staging, data) = host.shared_buffer(len)?;
     let on_card = if room && USED.fetch_add(len, Ordering::Relaxed) + len <= most {
         host.uav_buffer(len)
     } else {
         None
     };
+    BY_ADDRESS[usize::from(on_card.is_none())].fetch_add(len, Ordering::Relaxed);
     let buffer = match on_card {
         Some(buffer) => buffer,
-        None => host.shared_buffer(len)?.0,
+        None => {
+            static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if SAID.fetch_add(1, Ordering::Relaxed) < 8 {
+                let [budget, used] = host.video_memory().map_or([0, 0], |[budget, used, ..]| [budget >> 20, used >> 20]);
+                tracing::warn!(
+                    start = format_args!("{start:#x}"),
+                    mb = len >> 20,
+                    card_used_mb = used,
+                    card_budget_mb = budget,
+                    on_card_mb = BY_ADDRESS[0].load(Ordering::Relaxed) >> 20,
+                    "title memory by address: no room on the card for this copy; shaders reach it in the PC's memory, over the bus"
+                );
+            }
+            host.shared_buffer(len)?.0
+        }
     };
     crate::host::name(&staging, || format!("title memory {start:#x}+{len:#x} by address, the CPU's side"));
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} by address"));
