@@ -124,7 +124,13 @@ impl Made {
     }
 }
 
+/// Each host heap's identity, handed out in order: a range of dynamic slots
+/// is given back only to the heap that took it ([`HostHeap::release_from`]).
+static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 pub(crate) struct HostHeap {
+    /// [`NEXT_ID`]'s number for this heap.
+    id: u64,
     pub(crate) buffer_sweep: Mutex<crate::draw::BufferSweep>,
     pub(crate) buffer_frame: std::sync::atomic::AtomicU64,
     pub(crate) heap: ID3D12DescriptorHeap,
@@ -1730,6 +1736,7 @@ impl HostHeap {
             .flatten();
         let queued = std::sync::Arc::new(Queued::new(if sampler { 0 } else { count }));
         let h = HostHeap {
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             buffer_sweep: Mutex::default(),
             buffer_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
             heap,
@@ -2782,6 +2789,23 @@ impl HostHeap {
     /// returned).
     ///
     /// [`dynamic`]: HostHeap::dynamic
+    /// This heap's identity ([`NEXT_ID`]): dynamic slots are given back only
+    /// to the heap that took them.
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// [`Self::release`] of a range taken from the heap of identity `id`:
+    /// nothing if that is not this heap. The title can release the heap a
+    /// list's slots came from, and a later heap can be made at the same
+    /// address before the list is reset: that list's reset must not free
+    /// slots of the new heap that other lists hold (fxceless/victory-fork#1324).
+    pub(crate) fn release_from(&self, id: u64, first: u32, n: u32) {
+        if id == self.id {
+            self.release(first, n);
+        }
+    }
+
     pub(crate) fn release(&self, first: u32, n: u32) {
         let Some(at) = first.checked_sub(self.count) else {
             return;
@@ -5656,6 +5680,26 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         for (kin, kept) in [(Kin::Same, [true; 3]), (Kin::Moved, [false, true, true]), (Kin::Sized, [false, true, true]), (Kin::Other, [false, false, true]), (Kin::None, [false; 3])] {
             assert_eq!([0, 1, 2].map(|keep| kin.kept(keep)), kept, "{kin:?}");
         }
+    }
+
+    /// Dynamic slots go back only to the heap that took them: a range given
+    /// back with another heap's identity frees nothing (fxceless/victory-fork#1324).
+    #[test]
+    fn dynamic_slots_are_given_back_only_to_the_heap_that_took_them() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(a) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let Some(b) = HostHeap::new(false, 4) else {
+            return;
+        };
+        assert_ne!(a.id(), b.id());
+        let first = a.dynamic(2).expect("two dynamic slots");
+        let free = a.free.load(Relaxed);
+        a.release_from(b.id(), first, 2);
+        assert_eq!(a.free.load(Relaxed), free, "another heap's identity gave the range back");
+        a.release_from(a.id(), first, 2);
+        assert_eq!(a.free.load(Relaxed), free + 2, "their own heap did not get the range back");
     }
 
     /// A constant buffer view larger than the host takes is cut to what it
