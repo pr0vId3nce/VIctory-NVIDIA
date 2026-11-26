@@ -88,6 +88,9 @@ const PIECE: usize = 4096;
 const MOST: usize = 3 << 14;
 /// Pages of title memory with small title buffers in them, at most.
 const WINDOWS: usize = 512;
+/// All this module asks of [`crate::shadow::by_address`], at most: its pages,
+/// the windows, and an arena more for the directory and a last arena begun.
+pub(crate) const BYTES_MOST: u64 = (MOST as u64 + WINDOWS as u64) * PAGE + ARENA;
 /// The biggest packed structure taken for one.
 const PACKED: u64 = 64 << 20;
 /// For so many frames what a page holds may still be on its way.

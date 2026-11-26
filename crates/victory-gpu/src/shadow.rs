@@ -5453,8 +5453,13 @@ pub(crate) fn small_buffer_in(address: u64, len: u64, most: u64) -> bool {
 
 /// The bytes of title memory by address ([`by_address`]) whose side for
 /// shaders is in the card's memory, and those whose side is in the PC's,
-/// since the start (arenas are kept for the run).
+/// since the start (arenas are kept for the run; one that goes is not
+/// counted down).
 static BY_ADDRESS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// The bytes [`by_address`] has asked of the card's own memory since the
+/// start, made or not: what its limit ([`by_address_most`]) is held against.
+static BY_ADDRESS_ASKED: AtomicU64 = AtomicU64::new(0);
 
 /// [`BY_ADDRESS`], for the memory line.
 pub(crate) fn by_address_bytes() -> [u64; 2] {
@@ -5472,21 +5477,25 @@ fn by_address_most() -> u64 {
 }
 
 /// [`memory_room_kept`]: nothing without the builder; else `head` MB (1,024
-/// unless said), and not more than memory by address may still take of the
-/// card (`most` less what it holds there).
-fn memory_room(builder: bool, head: Option<u64>, most: u64, on_card: u64) -> u64 {
+/// unless said), and not more than memory by address may still ask of the
+/// card (`most` less what it has `asked`).
+fn memory_room(builder: bool, head: Option<u64>, most: u64, asked: u64) -> u64 {
     if !builder {
         return 0;
     }
-    head.map_or(1024 << 20, |mb| mb.min(8192) << 20).min(most.saturating_sub(on_card))
+    head.map_or(1024 << 20, |mb| mb.min(8192) << 20).min(most.saturating_sub(asked))
 }
 
 /// The bytes of the card's memory the texture queue leaves free
 /// (`resource::room`) for title memory by address that is not made yet, with
 /// the ray-tracing structure builder asked for (`VICTORY_BVH_BUILDER=1`):
 /// `VICTORY_CARD_ROOM_FOR_MEMORY_MB` (1,024; 0: none, as before), kept ahead
-/// of the arenas as they come, until they hold all they may
-/// ([`by_address_most`]).
+/// of the arenas as they come, until they have asked for all they may (the
+/// lesser of [`by_address_most`] and `crate::memory::BYTES_MOST`). None
+/// without copies in the card's memory ([`cards`]).
+/// shortcut: kept while the builder is asked for, whether it runs or not,
+/// and after the arenas have stopped coming short of all they may (1.3 to
+/// 1.8 GB of some 3.1 in the runs so far).
 ///
 /// The builder's arenas come as structures stream in, after the texture
 /// queue has filled the card to its line and the world's targets and buffer
@@ -5511,7 +5520,12 @@ pub(crate) fn memory_room_kept() -> u64 {
     let head = *HEAD.get_or_init(|| {
         std::env::var("VICTORY_CARD_ROOM_FOR_MEMORY_MB").ok().and_then(|v| v.trim().parse::<u64>().ok())
     });
-    memory_room(crate::pipeline::builder_allowed(), head, by_address_most(), BY_ADDRESS[0].load(Ordering::Relaxed))
+    memory_room(
+        crate::pipeline::builder_allowed() && cards(),
+        head,
+        by_address_most().min(crate::memory::BYTES_MOST),
+        BY_ADDRESS_ASKED.load(Ordering::Relaxed),
+    )
 }
 
 #[cfg(test)]
@@ -5553,24 +5567,26 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     }
     // At most so much on the card's own memory (4 GiB unless
     // `VICTORY_MEMORY_CARD_MB` says otherwise); past that the side shaders
-    // see is in the PC's memory. Whatever the card's budget says: an arena
-    // in the PC's memory costs every access of every shader the bus (448 MB
-    // of 1,873 there: 2.2 s of the card's time a frame where 0.3 s was, and
-    // with more the card stopped answering), and over its budget the system
-    // moves what was used least. `VICTORY_MEMORY_CARD_ROOM=1`: only while
-    // the card is under 97 % of its budget, as before.
-    static USED: AtomicU64 = AtomicU64::new(0);
+    // see is in the PC's memory. With the structure builder asked for,
+    // whatever the card's budget says: an arena in the PC's memory costs
+    // every access of every shader the bus (448 MB of 1,873 there: 2.2 s of
+    // the card's time a frame where 0.3 s was, and with more the card
+    // stopped answering), and over its budget the system moves what was
+    // used least. `VICTORY_MEMORY_CARD_ROOM=1`, and without the builder (a
+    // page or two, read by rays that find nothing): only while the card is
+    // under 97 % of its budget, as before.
     let most = by_address_most();
     static ROOM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let room = !*ROOM.get_or_init(|| std::env::var_os("VICTORY_MEMORY_CARD_ROOM").is_some_and(|v| v == "1"))
-        || host.video_memory().is_none_or(|[budget, used, ..]| used + len < budget / 100 * 97);
+    let always = crate::pipeline::builder_allowed()
+        && !*ROOM.get_or_init(|| std::env::var_os("VICTORY_MEMORY_CARD_ROOM").is_some_and(|v| v == "1"));
+    let room = always || host.video_memory().is_none_or(|[budget, used, ..]| used + len < budget / 100 * 97);
     let (staging, data) = host.shared_buffer(len)?;
-    let on_card = if room && USED.fetch_add(len, Ordering::Relaxed) + len <= most {
+    let on_card = if room && BY_ADDRESS_ASKED.fetch_add(len, Ordering::Relaxed) + len <= most {
         host.uav_buffer(len)
     } else {
         None
     };
-    BY_ADDRESS[usize::from(on_card.is_none())].fetch_add(len, Ordering::Relaxed);
+    let place = usize::from(on_card.is_none());
     let buffer = match on_card {
         Some(buffer) => buffer,
         None => {
@@ -5583,12 +5599,13 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
                     card_used_mb = used,
                     card_budget_mb = budget,
                     on_card_mb = BY_ADDRESS[0].load(Ordering::Relaxed) >> 20,
-                    "title memory by address: no room on the card for this copy; shaders reach it in the PC's memory, over the bus"
+                    "title memory by address: this copy is not on the card (no room there, more than may be there, or the card refused it); shaders reach it in the PC's memory, over the bus"
                 );
             }
             host.shared_buffer(len)?.0
         }
     };
+    BY_ADDRESS[place].fetch_add(len, Ordering::Relaxed);
     crate::host::name(&staging, || format!("title memory {start:#x}+{len:#x} by address, the CPU's side"));
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} by address"));
     // (Counted down with the windows' on the card when it goes.)
