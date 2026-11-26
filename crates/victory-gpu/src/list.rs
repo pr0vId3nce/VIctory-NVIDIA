@@ -1044,17 +1044,62 @@ extern "system" fn copy_buffer_region(
 
 /// Whether one of two resources is a target in a stand-in format and the
 /// other is not ([`crate::resource::target_format`]): their texels differ
-/// in size, so the host cannot copy between them (logged once).
+/// in size, so the host cannot copy between them as they are.
 #[cfg(windows)]
 fn unlike(dst: This, src: This) -> bool {
-    let unlike = crate::resource::stands_in(dst) != crate::resource::stands_in(src);
-    if unlike {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| {
-            tracing::warn!(?dst, ?src, "copy between a stand-in target and title-format texels skipped")
-        });
+    crate::resource::stands_in(dst) != crate::resource::stands_in(src)
+}
+
+/// A copy [`unlike`] found and nothing converts: skipped (logged once).
+#[cfg(windows)]
+fn skipped(dst: This, src: This) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tracing::warn!(?dst, ?src, "copy between a stand-in target and title-format texels skipped")
+    });
+}
+
+/// The 16-bit format of a copy between a stand-in target and a texture in
+/// that format, which [`crate::standin`] converts; `None` for any other
+/// pair.
+#[cfg(windows)]
+fn convertible(dst: This, src: This) -> Option<u32> {
+    use crate::resource::stood_in_for;
+    let (format, other) = match (stood_in_for(dst), stood_in_for(src)) {
+        (Some(format), None) => (format, src),
+        (None, Some(format)) => (format, dst),
+        _ => return None,
+    };
+    let host = crate::resource::host_resource(other)?;
+    // SAFETY: a plain query of a live texture.
+    (unsafe { host.GetDesc() }.Format.0 as u32 == format).then_some(format)
+}
+
+/// Gets title textures `dst` and `src` ready for a texture to texture copy
+/// in `list`: what the title wrote to the source first, what shaders wrote
+/// to depth twins, the copy states; the destination is then host written.
+#[cfg(windows)]
+fn copy_states(list: &crate::host::HostList, dst: This, src: This) {
+    if let Some(from) = crate::resource::host_resource(src) {
+        // A source the title fills itself is uploaded first (upstream
+        // PR #671): a copy read whatever the host texture held.
+        if crate::texture::title_written(from) {
+            crate::texture::upload(list, src, from);
+        }
     }
-    unlike
+    // Depth textures shaders also write: what they wrote, first.
+    list.twin_use(dst, false, true);
+    list.twin_use(src, false, false);
+    ensure_state(list, dst, COPY_DEST);
+    ensure_state(list, src, COPY_SOURCE);
+    crate::texture::host_written(dst);
+}
+
+/// The title's list `this` ran a pass of ours ([`crate::standin`]): its
+/// draw state binds the title's root signature and pipeline again.
+#[cfg(windows)]
+fn after_conversion(this: This) {
+    with_state(this, |_, state| state.host_state_lost());
 }
 
 /// Copies left out because both sides were one host texture
@@ -1073,6 +1118,24 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(src),
         ) {
             if unlike(dst, src) {
+                let Some(format) = convertible(dst, src).filter(|_| crate::standin::ready()) else {
+                    skipped(dst, src);
+                    return;
+                };
+                copy_states(list, dst, src);
+                // The two have the same shape (the title's call asks it):
+                // subresource by subresource.
+                let count = crate::standin::subresources(to).min(crate::standin::subresources(from));
+                let mut made = 0;
+                for sub in 0..count {
+                    made += u32::from(crate::standin::record(list, format, to, sub, [0; 3], from, sub, None));
+                }
+                if made > 0 {
+                    after_conversion(this);
+                }
+                if made < count {
+                    skipped(dst, src);
+                }
                 return;
             }
             // Two title textures over the same memory have one host
@@ -1201,6 +1264,26 @@ extern "system" fn copy_texture_region(
             return;
         };
         if unlike(dst.resource, src.resource) {
+            const SUBRESOURCE: u32 = 0;
+            let format = (src.kind == SUBRESOURCE && dst.kind == SUBRESOURCE)
+                .then(|| convertible(dst.resource, src.resource))
+                .flatten();
+            let from = crate::resource::host_resource(src.resource);
+            let (Some(format), Some(from), true) = (format, from, crate::standin::ready()) else {
+                skipped(dst.resource, src.resource);
+                return;
+            };
+            copy_states(list, dst.resource, src.resource);
+            // SAFETY: the title's box (same layout as the host's), or null.
+            let area = unsafe { source_box.cast::<D3D12_BOX>().as_ref() }.copied();
+            // A subresource location holds its index where a footprint
+            // starts.
+            let (to_sub, from_sub) = (dst.footprint.offset as u32, src.footprint.offset as u32);
+            if crate::standin::record(list, format, to, to_sub, [x, y, z], from, from_sub, area) {
+                after_conversion(this);
+            } else {
+                skipped(dst.resource, src.resource);
+            }
             return;
         }
         let mut from = src;
@@ -1452,6 +1535,7 @@ extern "system" fn resolve(
         const RESOLVE_DEST: u32 = 0x1000;
         const RESOLVE_SOURCE: u32 = 0x2000;
         if unlike(dst, src) {
+            skipped(dst, src);
             return;
         }
         // Depth textures shaders also write: what they wrote, first.
