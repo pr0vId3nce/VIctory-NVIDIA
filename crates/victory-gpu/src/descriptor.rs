@@ -1796,6 +1796,9 @@ static FUNCTIONS: Table<24> = {
     Table(f)
 };
 
+#[cfg(all(windows, test))]
+pub(crate) use tests::with_test_view_heap;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1809,6 +1812,22 @@ mod tests {
     fn create(desc: HeapDesc, placement: Placement, out: &mut This) -> HRESULT {
         let extended = Extended(desc, placement);
         create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], out)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn with_test_view_heap(run: impl FnOnce(&Heap)) {
+        let mut this = std::ptr::null();
+        let desc = HeapDesc { kind: VIEWS_KIND, count: 4, flags: SHADER_VISIBLE, nodes: 0 };
+        let placement = Placement { address: 0, size: 0 };
+        assert_eq!(create(desc, placement, &mut this), S_OK);
+        struct TestHeap(This);
+        impl Drop for TestHeap {
+            fn drop(&mut self) {
+                release(self.0);
+            }
+        }
+        let heap = TestHeap(this);
+        run(super::heap(heap.0));
     }
 
     #[cfg(windows)]
