@@ -603,10 +603,15 @@ impl Halves<'_> {
                     attr,
                     ..
                 } if inst.name() == "v_interp_p1_f32" => (*attr, inst.read(Reg::V(*reg))),
-                Fields::Valu(v) if inst.name() == "v_interp_p1ll_f16" => match v.src.get(1) {
-                    Some(&Operand::Vector { reg, .. }) => (v.src[0], inst.read(Reg::V(reg))),
-                    _ => return Err("an interpolation without its first half"),
-                },
+                Fields::Valu(v) if inst.name() == "v_interp_p1ll_f16" => {
+                    if v.clamp || v.omod != 0 || v.abs != 0 || v.neg != 0 {
+                        kind = None;
+                    }
+                    match v.src.get(1) {
+                        Some(&Operand::Vector { reg, .. }) => (v.src[0], inst.read(Reg::V(reg))),
+                        _ => return Err("an interpolation without its first half"),
+                    }
+                }
                 _ => return Err("an interpolation without its first half"),
             };
             if a != *attr {
@@ -915,5 +920,58 @@ mod tests {
                 (3, Input::Position(1)),
             ]
         );
+    }
+
+    #[test]
+    fn f16_first_half_with_modifiers_falls_back_to_weighted() {
+        let attribute = Attribute {
+            usage: Usage::Generic,
+            row: 1,
+            channel: 0,
+            high: false,
+        };
+        let inputs = vec![PsInput {
+            fp16: true,
+            ..TEXCOORD
+        }];
+        let pair = |p1_w0: u32, p1_w1: u32| {
+            let p = program(&[
+                p1_w0,
+                p1_w1,
+                0xD75A_0002,
+                (258 << 18) | (257 << 9), // v_interp_p2_f16 v2, v1, attr0.x, v2
+                S_ENDPGM,
+            ]);
+            let mut interps = raise(&p, &pixel(inputs.clone(), 1 << 1))
+                .unwrap()
+                .interps;
+            interps.sort_by_key(|i| i.0);
+            interps
+        };
+        let base_w0 = 0xD742_0002; // v_interp_p1ll_f16 v2, v0, attr0.x
+        let base_w1 = 256 << 9;
+        assert_eq!(
+            pair(base_w0, base_w1),
+            [(
+                (0, 1),
+                Interp::Interpolated {
+                    attribute,
+                    barycentric: Barycentric::PerspectiveCenter,
+                    first: vec![(0, 0)],
+                }
+            )]
+        );
+        for (p1_w0, p1_w1) in [
+            (base_w0 | (1 << 15), base_w1), // clamp on first half
+            (base_w0, base_w1 | (1 << 27)), // omod on first half
+        ] {
+            assert_eq!(
+                pair(p1_w0, p1_w1),
+                [
+                    ((0, 0), Interp::Weighted { attribute }),
+                    ((0, 1), Interp::Weighted { attribute }),
+                ]
+            );
+        }
     }
 }

@@ -2798,7 +2798,30 @@ mod barycentric_tests {
         pixel_with_inputs(words, input_addr, &[element("TEXCOORD", 0, 0)])
     }
 
-    fn pixel_with_inputs(words: &[u32], input_addr: u32, inputs: &[container::SigElement]) -> Result<HostShader, ShaderError> {
+    pub(super) fn pixel_with_inputs(
+        words: &[u32],
+        input_addr: u32,
+        inputs: &[container::SigElement],
+    ) -> Result<HostShader, ShaderError> {
+        let ps_inputs = vec![PsInput {
+            usage: Usage::Generic,
+            row: 0,
+            mask: 0b1111,
+            attr: 0,
+            flat: false,
+            fp16: false,
+            pack2: false,
+            row2: 0,
+        }];
+        pixel_with(words, input_addr, inputs, ps_inputs)
+    }
+
+    fn pixel_with(
+        words: &[u32],
+        input_addr: u32,
+        inputs: &[container::SigElement],
+        ps_inputs: Vec<PsInput>,
+    ) -> Result<HostShader, ShaderError> {
         let native = NativeProgram {
             stage: HwStage::Ps,
             wave64: false,
@@ -2806,16 +2829,7 @@ mod barycentric_tests {
             layout: vec![],
             used: vec![],
             io: StageIo::Ps {
-                inputs: vec![PsInput {
-                    usage: Usage::Generic,
-                    row: 0,
-                    mask: 0b1111,
-                    attr: 0,
-                    flat: false,
-                    fp16: false,
-                    pack2: false,
-                    row2: 0,
-                }],
+                inputs: ps_inputs,
                 input_addr,
                 db_shader_control: 0,
                 patches: vec![],
@@ -3223,5 +3237,289 @@ mod barycentric_tests {
         let [e0, e1] = exp_mrt0(4);
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
+    }
+
+    fn v_interp_p1ll_f16(
+        dst: u32,
+        bary: u32,
+        attr_chan: u32,
+        omod: u32,
+        clamp: bool,
+        neg: u32,
+    ) -> [u32; 2] {
+        [
+            0xD742_0000 | dst | (u32::from(clamp) << 15),
+            (neg << 29) | (omod << 27) | ((256 + bary) << 9) | (attr_chan << 6),
+        ]
+    }
+
+    fn v_interp_p2_f16(
+        dst: u32,
+        bary: u32,
+        acc: u32,
+        attr_chan: u32,
+        high_dst: bool,
+        omod: u32,
+        clamp: bool,
+    ) -> [u32; 2] {
+        [
+            0xD75A_0000 | dst | (u32::from(high_dst) << 14) | (u32::from(clamp) << 15),
+            (omod << 27) | ((256 + acc) << 18) | ((256 + bary) << 9) | (attr_chan << 6),
+        ]
+    }
+
+    fn pixel_f16(words: &[u32]) -> Result<HostShader, ShaderError> {
+        pixel_with(
+            words,
+            PERSP_CENTER,
+            &[element("TEXCOORD", 0, 0)],
+            vec![PsInput {
+                usage: Usage::Generic,
+                row: 0,
+                mask: 0b1111,
+                attr: 0,
+                flat: false,
+                fp16: true,
+                pack2: false,
+                row2: 0,
+            }],
+        )
+    }
+
+    fn interp_p2_f16_modifiers_shader() -> HostShader {
+        let mut words = Vec::new();
+        // v2.lo = half(attr0.x * 0.5)
+        words.extend(v_interp_p1ll_f16(2, 0, 0, 0, false, 0));
+        words.extend(v_interp_p2_f16(2, 1, 2, 0, false, 3, false));
+        // v2.hi = half(clamp(attr0.y * 2.0)), preserving v2.lo
+        words.extend(v_interp_p1ll_f16(4, 0, 1, 0, false, 0));
+        words.extend(v_interp_p2_f16(2, 1, 4, 1, true, 1, true));
+        // v3.lo = half(attr0.z * 4.0)
+        words.extend(v_interp_p1ll_f16(5, 0, 2, 0, false, 0));
+        words.extend(v_interp_p2_f16(3, 1, 5, 2, false, 2, false));
+        // v3.hi = half(clamp(attr0.w)), preserving v3.lo
+        words.extend(v_interp_p1ll_f16(6, 0, 3, 0, false, 0));
+        words.extend(v_interp_p2_f16(3, 1, 6, 3, true, 0, true));
+        // Export all four 16-bit halves as floats to mrt0.
+        words.extend([
+            0x3600_00FF | (4 << 17) | (2 << 9), // v_and_b32 v4, 0xFFFF, v2
+            0xFFFF,
+            0x2C00_0090 | (5 << 17) | (2 << 9), // v_lshrrev_b32 v5, 16, v2
+            0x3600_00FF | (6 << 17) | (3 << 9), // v_and_b32 v6, 0xFFFF, v3
+            0xFFFF,
+            0x2C00_0090 | (7 << 17) | (3 << 9), // v_lshrrev_b32 v7, 16, v3
+            0x7E00_0D00 | (4 << 17) | 4,        // v_cvt_f32_u32 v4, v4
+            0x7E00_0D00 | (5 << 17) | 5,        // v_cvt_f32_u32 v5, v5
+            0x7E00_0D00 | (6 << 17) | 6,        // v_cvt_f32_u32 v6, v6
+            0x7E00_0D00 | (7 << 17) | 7,        // v_cvt_f32_u32 v7, v7
+            0xF800_180F,
+            0x0706_0504, // exp mrt0, v4, v5, v6, v7 done vm
+            S_ENDPGM,
+        ]);
+        pixel_f16(&words).unwrap()
+    }
+
+    fn interp_p1ll_f16_shader(clamp: bool) -> HostShader {
+        let mut words = Vec::new();
+        words.extend(v_interp_p1ll_f16(2, 0, 3, 0, clamp, 0));
+        words.extend(v_interp_p2_f16(2, 1, 2, 3, false, 0, false));
+        words.extend([
+            0x3600_00FF | (4 << 17) | (2 << 9), // v_and_b32 v4, 0xFFFF, v2
+            0xFFFF,
+            0x7E00_0D00 | (4 << 17) | 4,        // v_cvt_f32_u32 v4, v4
+            0xF800_180F,
+            0x0404_0404, // exp mrt0, v4, v4, v4, v4 done vm
+            S_ENDPGM,
+        ]);
+        pixel_f16(&words).unwrap()
+    }
+
+    fn with_f16_nearest<T>(nearest: bool, work: impl FnOnce() -> T) -> T {
+        struct Reset(Option<bool>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                super::lower::TEST_F16_NEAREST.set(self.0);
+            }
+        }
+        let _restore = Reset(super::lower::TEST_F16_NEAREST.replace(Some(nearest)));
+        work()
+    }
+
+    #[test]
+    fn interpolated_f16_honors_op_sel_and_output_modifiers() {
+        let single_pair = |p1_omod: u32, high_dst: bool, p2_omod: u32, p2_clamp: bool| {
+            let mut words = Vec::new();
+            words.extend(v_interp_p1ll_f16(2, 0, 0, p1_omod, false, 0));
+            words.extend(v_interp_p2_f16(2, 1, 2, 0, high_dst, p2_omod, p2_clamp));
+            words.extend(exp_mrt0(2));
+            words.push(S_ENDPGM);
+            pixel_f16(&words).unwrap()
+        };
+
+        let baseline = single_pair(0, false, 0, false);
+        validate(&baseline);
+        for (label, variant) in [
+            ("v_interp_p2_f16 op_sel[3]", single_pair(0, true, 0, false)),
+            ("v_interp_p2_f16 omod", single_pair(0, false, 1, false)),
+            ("v_interp_p2_f16 clamp", single_pair(0, false, 0, true)),
+            ("v_interp_p1ll_f16 omod", single_pair(1, false, 0, false)),
+        ] {
+            validate(&variant);
+            assert_ne!(
+                variant.dxil, baseline.dxil,
+                "{label} must change emitted DXIL"
+            );
+        }
+
+        let default_multi = with_f16_nearest(false, interp_p2_f16_modifiers_shader);
+        let nearest_multi = with_f16_nearest(true, interp_p2_f16_modifiers_shader);
+        validate(&default_multi);
+        validate(&nearest_multi);
+        assert_ne!(
+            nearest_multi.dxil, default_multi.dxil,
+            "VICTORY_F16_NEAREST=1 must change v_interp_p2_f16 narrowing in emitted DXIL"
+        );
+
+        // First half carrying clamp forces weighted lowering so the modifier is preserved.
+        let unclamped_p1 = interp_p1ll_f16_shader(false);
+        let clamped_p1 = interp_p1ll_f16_shader(true);
+        validate(&unclamped_p1);
+        validate(&clamped_p1);
+        assert_ne!(
+            clamped_p1.dxil, unclamped_p1.dxil,
+            "v_interp_p1ll_f16 clamp must change emitted DXIL"
+        );
+
+        // First half carrying operand modifiers (neg) must be rejected rather than ignored.
+        let mut neg_words = Vec::new();
+        neg_words.extend(v_interp_p1ll_f16(2, 0, 0, 0, false, 1));
+        neg_words.extend(v_interp_p2_f16(2, 1, 2, 0, false, 0, false));
+        neg_words.extend(exp_mrt0(2));
+        neg_words.push(S_ENDPGM);
+        assert!(pixel_f16(&neg_words).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn interpolated_f16_draw_checks_high_half_modifiers_and_single_rounding() {
+        use super::bitcode::{Attr, Term};
+        use super::host::{Draw, Host};
+        use super::shader::Shader;
+        use windows::Win32::Graphics::Direct3D12::D3D12_SHADER_VISIBILITY_PIXEL;
+
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut s = Shader::new(false);
+        let b = s.entry;
+        let mut pos_in = element("POSITION", 0, 0);
+        pos_in.usage = 15;
+        let mut tex_in = element("TEXCOORD", 0, 1);
+        tex_in.usage = 15;
+        s.inputs = vec![pos_in, tex_in];
+        let mut tex_out = element("TEXCOORD", 0, 0);
+        tex_out.usage = 15;
+        tex_out.interp = 2;
+        let mut pos_out = element("SV_Position", 3, 1);
+        pos_out.usage = 15;
+        pos_out.interp = 4;
+        s.outputs = vec![tex_out, pos_out];
+        for (in_id, out_id) in [(1u32, 0u32), (0, 1)] {
+            for col in 0..4u8 {
+                let load = [s.m.i32(in_id), s.m.i32(0), s.m.i8(col), s.m.undef(s.t.i32)];
+                let v = s.op(b, "loadInput.f32", Attr::ReadNone, s.t.f32, 4, &load);
+                let store = [s.m.i32(out_id), s.m.i32(0), s.m.i8(col), v];
+                s.op(b, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &store);
+            }
+        }
+        s.m.terminate(b, Term::Ret);
+        let mut vs = s.finish();
+        if let Ok(mut v) =
+            super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut vs).unwrap();
+        }
+
+        // ch0: 98304.0 * 0.5 -> 49152.0 (0x7A00), overflows if narrowed first; preserved on v2.hi write
+        // ch1: clamp(0.75 * 2.0) -> 1.0 (0x3C00), in v2.hi via op_sel[3]
+        // ch2: (2^-15 + 2^-25) * 4.0 -> 0x0801, would narrow to 0x0200 then 0x0800 if rounded twice
+        // ch3: clamp(-0.5) -> 0.0 (0x0000), in v3.hi via op_sel[3], preserving v3.lo
+        let (c0, c1, c2, c3) = (
+            98304.0f32,
+            0.75f32,
+            f32::from_bits(0x3800_2000),
+            -0.5f32,
+        );
+        #[rustfmt::skip]
+        let vertices = [
+            -1.0, -1.0, 0.5, 1.0, c0, c1, c2, c3,
+            -1.0,  3.0, 0.5, 1.0, c0, c1, c2, c3,
+             3.0, -1.0, 0.5, 1.0, c0, c1, c2, c3,
+        ];
+        let mut ran = 0;
+        for (label, warp) in [("WARP", true), ("hardware", false)] {
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("no SM 6.6 {label} device; skipped");
+                continue;
+            };
+            for nearest in [false, true] {
+                let ps = with_f16_nearest(nearest, interp_p2_f16_modifiers_shader);
+                let root = host
+                    .root_signature_for(&[(&ps, D3D12_SHADER_VISIBILITY_PIXEL)])
+                    .unwrap();
+                let pso = host
+                    .pipeline_with(&root, &vs, &ps.dxil)
+                    .unwrap_or_else(|e| panic!("{label} nearest={nearest}: pipeline: {e}"));
+                let texels = host
+                    .draw(
+                        &root,
+                        &pso,
+                        &Draw {
+                            roots: Vec::new(),
+                            textures: &[],
+                            samplers: &[],
+                            vertices: &vertices,
+                            stride: 32,
+                            size: (2, 2),
+                            mesh_groups: 0,
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{label} nearest={nearest}: draw: {e}"));
+                assert_eq!(texels.len(), 4);
+                for (i, &texel) in texels.iter().enumerate() {
+                    let got = texel.map(|x| x as u32);
+                    let want = [0x7A00u32, 0x3C00, 0x0801, 0x0000];
+                    assert_eq!(
+                        got, want,
+                        "{label} nearest={nearest} texel {i}: got {got:#06x?}, want {want:#06x?}"
+                    );
+                }
+            }
+            let clamped_p1 = interp_p1ll_f16_shader(true);
+            let root = host
+                .root_signature_for(&[(&clamped_p1, D3D12_SHADER_VISIBILITY_PIXEL)])
+                .unwrap();
+            let pso = host.pipeline_with(&root, &vs, &clamped_p1.dxil).unwrap();
+            let texels = host
+                .draw(
+                    &root,
+                    &pso,
+                    &Draw {
+                        roots: Vec::new(),
+                        textures: &[],
+                        samplers: &[],
+                        vertices: &vertices,
+                        stride: 32,
+                        size: (2, 2),
+                        mesh_groups: 0,
+                    },
+                )
+                .unwrap();
+            for &texel in &texels {
+                assert_eq!(texel.map(|x| x as u32), [0x0000u32; 4]);
+            }
+            ran += 1;
+        }
+        assert!(ran > 0, "expected at least WARP or hardware D3D12 device");
     }
 }
