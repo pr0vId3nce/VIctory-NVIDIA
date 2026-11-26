@@ -861,6 +861,56 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
         copy_through_phis(p, &mut copy);
     }
     let root = |v: Value| if deep { follow(&copy, v) } else { v };
+    // EXEC on entry, which EXEC never holds a lane beyond.
+    let entry: Vec<Value> = p.inputs.iter().filter(|(r, _)| matches!(r, Reg::S(EXEC | 127))).map(|x| x.1).collect();
+    let is_exec = |r: &Reg| matches!(r, Reg::S(EXEC | 127));
+    // `deep`: the mask `s_and_saveexec_b64 <saved>, <EXEC on entry>` saves, when it closes
+    // block `b` before its skip. That skip is taken only with no lane left, and the restore
+    // of the saved mask at the join leaves none either.
+    let entry_skip = |b: usize| -> Option<Vec<Value>> {
+        let i = p.blocks[b].insts.iter().rev().nth(1)?;
+        let mask: Vec<Value> = i.reads.iter().filter(|(r, _)| !is_exec(r)).map(|x| root(x.1)).collect();
+        (deep
+            && entry.len() == 2
+            && i.name() == "s_and_saveexec_b64"
+            && mask.len() == 2
+            && mask.iter().all(|m| entry.contains(m)))
+        .then(|| i.writes.iter().filter(|(r, _)| matches!(r, Reg::S(_)) && !is_exec(r)).map(|x| x.1).collect())
+    };
+    // Whether `v` (a join's scalar) is read only by image and buffer instructions of the join
+    // block, after the block's first instruction restores EXEC from `saved` and before EXEC
+    // changes again: lane work that, after a skip of [`entry_skip`], has no lane to do it.
+    let read_without_lanes = |join: usize, v: Value, saved: &[Value]| -> bool {
+        let elsewhere = p.blocks.iter().enumerate().any(|(x, blk)| {
+            blk.phis.iter().any(|f| f.args.contains(&v))
+                || x != join && blk.insts.iter().any(|i| i.reads.iter().any(|r| r.1 == v))
+        });
+        if elsewhere || saved.len() != 2 {
+            return false;
+        }
+        let insts = &p.blocks[join].insts;
+        let Some(first) = insts.first() else { return false };
+        if !(first.name() == "s_mov_b64"
+            && first.writes.iter().all(|w| is_exec(&w.0))
+            && first.reads.iter().all(|r| saved.contains(&r.1)))
+        {
+            return false;
+        }
+        let mut open = true;
+        for i in &insts[1..] {
+            if i.reads.iter().any(|r| r.1 == v) {
+                let n = i.name();
+                let memory = n.starts_with("image_") || n.starts_with("buffer_") || n.starts_with("tbuffer_");
+                if !(open && memory) {
+                    return false;
+                }
+            }
+            if i.writes.iter().any(|w| is_exec(&w.0)) {
+                open = false;
+            }
+        }
+        true
+    };
     // The region a skip of `b` to `target` leaves out, if it is a pure skip.
     let skipped = |b: usize, target: usize, first: usize| -> Option<Vec<bool>> {
         let mut inside = vec![false; n];
@@ -886,6 +936,7 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
         }
         // the join sees no scalar the region changed
         let join = &p.blocks[target];
+        let saved = entry_skip(b);
         for phi in &join.phis {
             let scalar = match phi.reg {
                 Reg::S(c) => c != 126 && c != 127,
@@ -899,7 +950,9 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
             let before: Vec<Value> =
                 join.preds.iter().zip(&phi.args).filter(|(q, _)| **q == b).map(|(_, a)| root(*a)).collect();
             let within = join.preds.iter().zip(&phi.args).filter(|(q, _)| inside[**q]).map(|(_, a)| root(*a));
-            if within.into_iter().any(|a| !before.contains(&a)) {
+            if within.into_iter().any(|a| !before.contains(&a))
+                && !saved.as_ref().is_some_and(|saved| read_without_lanes(target, phi.value, saved))
+            {
                 return None;
             }
         }
