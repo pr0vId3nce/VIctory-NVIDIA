@@ -808,7 +808,8 @@ impl Memory {
              {:.1} pages that had no copy, {:.1} pages turned down, {:.1} results brought back; {:.0} pages looked at, {:.1} KB changed, \
              {:.1} packed structures ({} there), {:.2} ms; {} windows; since the last line {} KB of packed structures came and {} of them went, \
              and pages for constants {}, views written {}, others {}, upload memory {}, faults in all {}; \
-             of all memory by address {} MB has its shaders' side on the card and {} MB in the PC's memory; \n             since the last line {} different pages faulted, {:.1} a frame left without a copy by the bounds ({} in all)",
+             of all memory by address {} MB has its shaders' side on the card and {} MB in the PC's memory; \
+             since the last line {} different pages faulted, {:.1} a frame left without a copy by the bounds ({} in all)",
             self.pages.len(),
             (self.pages.len() as u64 * PAGE) >> 20,
             self.arenas.len(),
