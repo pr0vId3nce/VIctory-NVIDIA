@@ -265,33 +265,8 @@ pub extern "system" fn XMemVirtualQuery(
 const ALIGNMENT_SHIFT: u64 = 24;
 const ALLOC_32BIT: u64 = 1 << 33;
 /// Our block header: the block's size and alignment, just below the
-/// pointer handed out. The alignment's lowest bit says the block is memory
-/// of its own ([`WATCHED_FROM`]), not the host heap's.
+/// pointer handed out.
 const HEADER: usize = 2 * size_of::<usize>();
-
-/// From this size on a block of [`XMemAllocDefault`] is memory of its own
-/// that the host watches for writes, as title memory from `XMemVirtualAlloc`
-/// is (`VICTORY_XMEM_WATCHED=0`: the host heap's, as before).
-///
-/// Committed resources get their memory here when the title's hooks pass
-/// the call on (`victory_gpu::resource::Memory::for_resource`), and a block
-/// of the host heap cannot be asked what was written: the copy of a buffer
-/// in it was taken whole at every refresh and sent up whole. The title's
-/// upscaler keeps a buffer of 21 MB so (Series S): 42 MB copied and 21 MB
-/// sent up a frame, of bytes only the card ever changes.
-const WATCHED_FROM: usize = 1 << 20;
-
-fn watched_blocks() -> bool {
-    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_XMEM_WATCHED").is_none_or(|v| v != "0"));
-    *ON
-}
-
-/// Whether a block of `layout` (the size asked and its alignment's worth in
-/// front) is one of its own: big enough, and aligned to no more than the
-/// 64 KiB the host gives such memory.
-fn watched_block(layout: Layout, on: bool) -> bool {
-    on && layout.size() - layout.align() >= WATCHED_FROM && layout.align() <= PAGE
-}
 
 fn layout(size: usize, attributes: u64) -> Option<Layout> {
     // An alignment of at least 16 leaves room for the header.
@@ -375,22 +350,6 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     // console's; nothing seen builds ray-tracing structures in this memory
     // (the title uses its GPU heap). Sub-allocate from a
     // reservation below 2^40 if one does.
-    if watched_block(layout, watched_blocks()) {
-        // SAFETY: plain allocation; zeroed and aligned to 64 KiB by the host.
-        let block = unsafe {
-            VirtualAlloc(std::ptr::null(), layout.size(), MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
-        }
-        .cast::<u8>();
-        if !block.is_null() {
-            // SAFETY: as below; the marked alignment tells the free.
-            return unsafe {
-                let user = block.add(layout.align());
-                user.sub(HEADER).cast::<[usize; 2]>().write([layout.size(), layout.align() | 1]);
-                user.cast()
-            };
-        }
-        // (No address space of that kind: the heap may still have it.)
-    }
     // SAFETY: the layout has a non-zero size.
     let block = unsafe { alloc(layout) };
     if block.is_null() {
@@ -422,11 +381,6 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
         }
         let user = address.cast::<u8>();
         let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
-        if align & 1 != 0 {
-            // A block of its own ([`WATCHED_FROM`]).
-            VirtualFree(user.sub(align & !1).cast(), 0, MEM_RELEASE);
-            return;
-        }
         dealloc(
             user.sub(align),
             Layout::from_size_align_unchecked(size, align),
@@ -2866,53 +2820,6 @@ mod tests {
         let process = unsafe { GetCurrentProcess() };
         assert_eq!(XMemVirtualQuery(process, address, &mut info), 1);
         info
-    }
-
-    /// Whether the host answers what was written at `address`: it does of
-    /// write-watched memory alone.
-    fn watched(address: *const u8) -> bool {
-        let mut written = [std::ptr::null_mut::<c_void>(); 4];
-        let (mut count, mut granularity) = (written.len(), 0u32);
-        // SAFETY: plain query; it writes at most `count` addresses.
-        unsafe {
-            windows_sys::Win32::System::Memory::GetWriteWatch(
-                0,
-                address.cast(),
-                4096,
-                written.as_mut_ptr(),
-                &mut count,
-                &mut granularity,
-            ) == 0
-        }
-    }
-
-    #[test]
-    fn a_big_default_block_is_watched_memory_of_its_own() {
-        const BIG: usize = 2 << 20;
-        // (A buffer's memory: 64 KiB alignment, as the device asks for it.)
-        for attributes in [0u64, 0x10 << ALIGNMENT_SHIFT] {
-            let block = XMemAllocDefault(BIG, attributes).cast::<u8>();
-            assert!(!block.is_null());
-            // SAFETY: `BIG` bytes of ours.
-            unsafe {
-                assert_eq!((block.read(), block.add(BIG - 1).read()), (0, 0), "zeroed");
-                block.add(BIG - 1).write(7);
-            }
-            assert!(watched(block), "the host can say what was written in it");
-            XMemFreeDefault(block.cast(), attributes);
-        }
-        // A small one is the heap's, as before, and so is one aligned past 64 KiB.
-        for (size, attributes) in [(4096usize, 0u64), (BIG, 0x15 << ALIGNMENT_SHIFT)] {
-            let block = XMemAllocDefault(size, attributes).cast::<u8>();
-            assert!(!block.is_null());
-            assert!(!watched(block));
-            XMemFreeDefault(block.cast(), attributes);
-        }
-        // The rule itself: by the size asked, not the block's.
-        let layout = |size, attributes| layout(size, attributes).unwrap();
-        assert!(watched_block(layout(WATCHED_FROM, 0), true));
-        assert!(!watched_block(layout(WATCHED_FROM - 1, 0), true));
-        assert!(!watched_block(layout(WATCHED_FROM, 0), false));
     }
 
     #[test]

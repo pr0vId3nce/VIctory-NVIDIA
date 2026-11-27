@@ -1694,7 +1694,7 @@ impl<'a> Lower<'a> {
                     n.starts_with("v_mbcnt")
                         || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                         || n.starts_with("ds_permute")
-                        // `ds_bpermute` reads within its own 32-lane half (Belobug #363).
+                        || n.starts_with("ds_bpermute")
                         || reads_mask_as_data(x.st, i)
                 }) || lane_constant_masks(x.st)
                     || !x.st.wide.is_empty();
@@ -1759,8 +1759,8 @@ impl<'a> Lower<'a> {
                             "v_readlane"
                         } else if n == "v_writelane_b32" {
                             "v_writelane"
-                        } else if n.starts_with("ds_permute") {
-                            "ds_permute"
+                        } else if n.starts_with("ds_permute") || n.starts_with("ds_bpermute") {
+                            "ds_(b)permute"
                         } else if reads_mask_as_data(x.st, i) {
                             "mask as data"
                         } else {
@@ -5303,15 +5303,6 @@ impl<'a> Lower<'a> {
         r.unwrap_or(x)
     }
 
-    /// `x` of lane `src` of this lane's quad: by `lanes` when every quad takes the same
-    /// pattern, else lane by lane ([`Self::quad_pick`]).
-    fn quad_from(&mut self, x: V, src: V, lanes: Option<[u8; 4]>) -> V {
-        match lanes {
-            Some(lanes) => self.quad_read(x, lanes),
-            None => self.quad_pick(x, src),
-        }
-    }
-
     /// `x` in the first lane of this host wave where `guard` holds, and whether it has such a
     /// lane: the console reads the first lane of EXEC, and a lane that got here with EXEC clear
     /// (a guard, not a branch) is not one. With none, `x` of the wave's first lane here.
@@ -5463,14 +5454,6 @@ impl<'a> Lower<'a> {
                 } else {
                     [0, 1, 2, 3].map(|i| ((i & offset | offset >> 5 & 3) ^ offset >> 10 & 3) as u8 & 3)
                 };
-                // A source lane outside EXEC gives 0: each lane offers 0 where it is not in it.
-                let x = match guard {
-                    Some(on) => {
-                        let zero = k(self, 0);
-                        self.s.m.select(c, on, x, zero)
-                    }
-                    None => x,
-                };
                 self.quad_read(x, lanes)
             } else {
                 self.read_lane(x, src)
@@ -5481,15 +5464,8 @@ impl<'a> Lower<'a> {
         }
         if name == "ds_bpermute_b32" {
             // Backward permute: no LDS is touched. Each lane takes the data
-            // register of the lane its address names, (address + offset) / 4,
-            // within its own 32-lane half: GFX10 permutes the two halves of a
-            // wave of 64 on their own (RDNA ISA; LLVM's
-            // `supportsWaveWideBPermute` is false for wave64 from GFX10 on,
-            // and Mesa ACO's `emit_bpermute` emulates a wave-wide one). So
-            // lane l reads lane (l & 32) | (that & 31): in the same host wave
-            // on a host of 32 lanes too, where each host wave is one half of
-            // the console's (Belobug #363). A source lane outside EXEC gives
-            // 0. (
+            // register of the lane its address names, (address + offset) / 4
+            // within the wave; a source lane outside EXEC gives 0. (
             // the title's checkerboard shadow-mask generators read their
             // neighbours' samples with it; without them every shadowed light
             // was multiplied by an empty mask.)
@@ -5497,22 +5473,19 @@ impl<'a> Lower<'a> {
             // host (it left through a branch, not a guard) is read as the
             // host gives it; the console reads 0.
             self.cross_lane(false)?;
+            if self.exchange.as_ref().is_some_and(|e| !e.1) {
+                // a console wave of 64 run as two host waves: the lane named
+                // may be in the other one
+                return Err("a lane permute across two host waves");
+            }
             let at = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
             let x = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];
             let o = self.s.m.i32(offset);
             let at = self.s.m.bin(c, Bin::Add, at, o);
             let two = self.s.m.i32(2);
             let src = self.s.m.bin(c, Bin::LShr, at, two);
-            let k31 = self.s.m.i32(31);
-            let mut src = self.s.m.bin(c, Bin::And, src, k31);
-            if self.wave() == 64 {
-                // The lane's own half: bit 5 of its host lane, which is 0 in
-                // a host wave of 32 (one half of the console's wave).
-                let lane = self.lane_index();
-                let k32 = self.s.m.i32(32);
-                let half = self.s.m.bin(c, Bin::And, lane, k32);
-                src = self.s.m.bin(c, Bin::Or, src, half);
-            }
+            let last = self.s.m.i32(self.wave() - 1);
+            let src = self.s.m.bin(c, Bin::And, src, last);
             let x = match guard {
                 Some(g) => {
                     let z = self.s.m.i32(0);
@@ -8292,7 +8265,7 @@ impl<'a> Lower<'a> {
         }
         let mut guard = self.guard(b, i)?;
         if let Some(d) = v.dpp {
-            let (x, enable) = self.dpp(inst, d, guard)?;
+            let (x, enable) = self.dpp(inst, d)?;
             guard = match (guard, enable) {
                 (Some(g), Some(e)) => Some(self.s.m.bin(self.cur, Bin::And, g, e)),
                 (g, e) => g.or(e),
@@ -8305,8 +8278,8 @@ impl<'a> Lower<'a> {
     }
 
     /// DPP: src0 as read from another lane, and which lanes write their
-    /// result (none: all). `exec`: the lanes in EXEC here (none: all).
-    fn dpp(&mut self, inst: &Inst, dpp: Dpp, exec: Option<V>) -> Result<(V, Option<V>), Why> {
+    /// result (none: all).
+    fn dpp(&mut self, inst: &Inst, dpp: Dpp) -> Result<(V, Option<V>), Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
@@ -8314,13 +8287,9 @@ impl<'a> Lower<'a> {
             return Err("a DPP operand");
         };
         let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("a DPP operand")?)?;
-        // Quad permutations, and DPP8 whose every lane picks one of its own quad, stay in
-        // groups the pixel layout shares.
-        let quad = match dpp {
-            Dpp::Row { ctrl, .. } => ctrl <= 0xFF,
-            Dpp::Lanes { sel, .. } => (0..8).all(|i| (sel >> (3 * i) ^ i) & 4 == 0),
-        };
-        let mesh_quad = self.s.mesh.is_some() && quad && matches!(dpp, Dpp::Row { .. });
+        // Quad permutations and DPP8 stay in groups the pixel layout shares.
+        let quad = matches!(dpp, Dpp::Row { ctrl: 0..=0xFF, .. });
+        let mesh_quad = self.s.mesh.is_some() && quad;
         if !mesh_quad {
             self.cross_lane(quad)?;
         }
@@ -8399,45 +8368,16 @@ impl<'a> Lower<'a> {
                 (src, inside, masks, bound_ctrl)
             }
         };
-        // The same lane pattern in every quad: a quad permutation, or DPP8 whose second quad
-        // of eight picks as its first.
-        let lanes = match dpp {
-            Dpp::Row { ctrl, .. } => Some([0, 1, 2, 3].map(|i| (ctrl >> (2 * i) & 3) as u8)),
-            Dpp::Lanes { sel, .. } if (sel ^ sel >> 12) & 0x6DB == 0 => {
-                Some([0, 1, 2, 3].map(|i| (sel >> (3 * i) & 3) as u8))
-            }
-            Dpp::Lanes { .. } => None,
-        };
-        let pixel_quad = !mesh_quad && self.helpers_read(quad);
         let mut r = if mesh_quad {
             self.quad_pick(x, src)
-        } else if pixel_quad {
-            self.quad_from(x, src, lanes)
+        } else if let Dpp::Row { ctrl, .. } = dpp
+            && self.helpers_read(quad)
+        {
+            self.quad_read(x, [0, 1, 2, 3].map(|i| (ctrl >> (2 * i) & 3) as u8))
         } else {
             self.read_lane(x, src)
         };
         let mut enable = None;
-        // A source lane outside EXEC (without fetch-inactive): DPP8 and bound_ctrl read 0
-        // from it, else the lane does not write. Not the same as a destination outside EXEC,
-        // which only keeps its own value.
-        let fi = match dpp {
-            Dpp::Row { fi, .. } | Dpp::Lanes { fi, .. } => fi,
-        };
-        let mut source_on = None;
-        if pixel_quad
-            && !fi
-            && let Some(exec) = exec
-        {
-            let bits = self.s.m.cast(c, Cast::ZExt, exec, self.s.t.i32);
-            let source = self.quad_from(bits, src, lanes);
-            let z = k(self, 0);
-            let on = self.s.m.cmp(c, pred::NE, source, z);
-            if zero || matches!(dpp, Dpp::Lanes { .. }) {
-                r = self.s.m.select(c, on, r, z);
-            } else {
-                source_on = Some(on);
-            }
-        }
         if let Some(inside) = inside {
             if zero {
                 let z = k(self, 0);
@@ -8460,12 +8400,6 @@ impl<'a> Lower<'a> {
             let (one, z) = (k(self, 1), k(self, 0));
             let both = self.s.m.bin(c, Bin::And, both, one);
             let on = self.s.m.cmp(c, pred::NE, both, z);
-            enable = Some(match enable {
-                Some(e) => self.s.m.bin(c, Bin::And, e, on),
-                None => on,
-            });
-        }
-        if let Some(on) = source_on {
             enable = Some(match enable {
                 Some(e) => self.s.m.bin(c, Bin::And, e, on),
                 None => on,

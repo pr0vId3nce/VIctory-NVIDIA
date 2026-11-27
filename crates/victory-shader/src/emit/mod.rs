@@ -89,8 +89,6 @@ mod diff_tests;
 #[cfg(all(test, windows))]
 mod filter3d_tests;
 #[cfg(all(test, windows))]
-mod helper_lane_tests;
-#[cfg(all(test, windows))]
 mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
@@ -115,7 +113,6 @@ mod waterfall_tests;
 #[cfg(all(test, windows))]
 mod wave64_tests;
 mod wave;
-mod water_tile_slots;
 
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
@@ -486,24 +483,13 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     }
 }
 
-/// Brings a console program into the form this host translates, where one differs from the
-/// program as the title has it: on a host of 32-lane waves the water light's tile lists take
-/// a slot a lane ([`water_tile_slots`]). [`translate`] does this itself; a caller that parses
-/// the container and calls [`emit`] calls this first. Returns whether the program changed.
-pub fn host_form(c: &Container, native: &mut NativeProgram) -> bool {
-    lower::host_max_wave() == 32
-        && c.digest == water_tile_slots::CONTAINER
-        && water_tile_slots::on()
-        && water_tile_slots::rewrite(native)
-}
-
 fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
         .or(c.part(FourCC::ACCC))
         .ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let mut native = crate::native_programs(dxil.data)?
+    let native = crate::native_programs(dxil.data)?
         .into_iter()
         .find(|p| {
             matches!(
@@ -515,9 +501,6 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
-    // The water light's tile lists on a host of 32-lane waves: a slot a lane
-    // ([`water_tile_slots`]), so no tile is lost between the two host waves of a group.
-    host_form(&c, &mut native);
     let p = crate::spill::build(&native)?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
@@ -2863,7 +2846,7 @@ mod barycentric_tests {
         3 << 25 | dst << 17 | b << 9 | (256 + a)
     }
 
-    pub(super) fn element(name: &str, kind: u8, row: u32) -> SigElement {
+    fn element(name: &str, kind: u8, row: u32) -> SigElement {
         SigElement {
             name: name.into(),
             index: 0,
