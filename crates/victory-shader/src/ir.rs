@@ -2289,6 +2289,13 @@ mod tests {
         assert!(without_skips(&program(ENTRY, &[0x7E04_0206]), true).is_none());
         // read after EXEC changed again (s_mov_b64 exec, s[40:41]): kept
         assert!(without_skips(&program(ENTRY, &[0xBEFE_0428, LOAD, LOAD1]), true).is_none());
+        // the join sets EXEC from no register (s_mov_b64 exec, -1), not from the saved mask: kept
+        // (as `program(ENTRY, &[LOAD, LOAD1])` with that in place of RESTORE)
+        let all = build_words(
+            &[0xBEA8_047E, 0x7D88_0000, 0xBE80_246A, ENTRY, 0xBF88_0002, SET, 0xBE87_0380, 0xBEFE_04C1, LOAD, LOAD1, S_ENDPGM],
+            true,
+        );
+        assert!(without_skips(&all, true).is_none());
     }
 
     /// A region with a loop in it keeps its skip, whatever the scalars after the join: the
