@@ -112,6 +112,12 @@ pub(crate) fn wanted(at: u64, len: u64) -> bool {
 /// memory is one stretch of a section: a buffer placed in the region's
 /// heap. `None` leaves the caller to do what it did before.
 pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
+    // Title memory that is a driver heap of ours (`crate::uma`): placed in
+    // it, whether or not this port is on.
+    if let Some(placed) = crate::uma::place_for(start, len) {
+        crate::inplace::counted(window, len);
+        return Some(placed);
+    }
     if !wanted(start, len) {
         return None;
     }

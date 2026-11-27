@@ -54,6 +54,8 @@ mod inplace;
 #[cfg(windows)]
 mod port;
 #[cfg(windows)]
+mod uma;
+#[cfg(windows)]
 mod port_cbv;
 #[cfg(windows)]
 pub mod port_descriptors;
@@ -137,6 +139,8 @@ pub fn frame_phase() -> u32 {
 pub fn frames_begun() -> u64 {
     frame::current()
 }
+#[cfg(windows)]
+pub use uma::{title_memory_backed, title_memory_in_uma_heap, uma_heap_on};
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
 #[cfg(windows)]

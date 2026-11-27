@@ -1004,6 +1004,7 @@ pub(crate) fn pages_written(pages: &[usize], offset: usize, len: usize) {
     if len == 0 {
         return;
     }
+    uma_written(pages, offset, len);
     for (at, bytes) in shown_at(pages, offset, len) {
         if stream_notice() {
             victory_gpu::kernel_will_write(at, bytes);
@@ -1756,7 +1757,23 @@ mod pool {
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
 /// must lie in one placeholder.
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
-    let own = physical.holes.remove(&base) == Some(len) && lean();
+    if uma_backed(base, len) {
+        // The title maps pages again where a driver heap of ours is: what it
+        // shows stays the heap's (`victory_gpu::title_memory_backed`).
+        uma_said("the title maps physical pages again over title memory that is a driver heap: left as it was", base, len);
+        return true;
+    }
+    let mut own = physical.holes.remove(&base) == Some(len) && lean();
+    match uma_back(base, len, &slice, own) {
+        Some(true) => {
+            shown_mut().note(base, len, &slice);
+            victory_gpu::title_memory_remapped(base, len);
+            return true;
+        }
+        // A placeholder of exactly this range again.
+        Some(false) => own = true,
+        None => {}
+    }
     if !show(base, len, &slice, own) {
         return false;
     }
@@ -1770,6 +1787,134 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     victory_gpu::title_memory_view(base, len, slice.section.handle as usize, (slice.index * PAGE) as u64);
     physical.views.insert(base, (len, slice));
     true
+}
+
+/// `VICTORY_UMA_HEAP` (`victory_gpu::uma_heap_on`): pages the title maps
+/// into its 32-bit graphics reservation ([`LOW_RESERVATIONS`]) become a
+/// heap of the driver's mapped at the same address, instead of a view of
+/// the section, so the card reads and writes the title's bytes as the
+/// driver's own memory (on NVIDIA much faster than a heap opened on title
+/// pages). The stretches backed so far.
+static UMA_BACKED: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+/// Since the start: stretches backed, asks that fell back, pages put into
+/// them after DirectStorage wrote their section, bytes of it.
+static UMA_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+fn uma_on() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(victory_gpu::uma_heap_on);
+    *ON
+}
+
+/// Whether `[base, base + len)` touches a stretch [`uma_back`] backed.
+fn uma_backed(base: usize, len: usize) -> bool {
+    uma_on() && UMA_BACKED.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(at, n)| at < base + len && base < at + n)
+}
+
+fn uma_said(what: &str, base: usize, len: usize) {
+    static SAID: AtomicU64 = AtomicU64::new(0);
+    let n = SAID.fetch_add(1, Ordering::Relaxed);
+    if n < 8 || n.is_power_of_two() {
+        tracing::warn!(at = format_args!("{base:#x}"), len, times = n + 1, "UMA heap: {what}");
+    }
+}
+
+/// [`map`]'s part for [`UMA_BACKED`]: `None` if not asked for here (the
+/// placeholder untouched); `Some(true)` if `[base, base + len)` is now a
+/// driver heap holding what the section's pages held; `Some(false)` if
+/// that was refused and the range is a placeholder of its own again.
+fn uma_back(base: usize, len: usize, slice: &Slice, own: bool) -> Option<bool> {
+    if !uma_on() || on_wine() {
+        return None;
+    }
+    let low = LOW_RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(at, n)| at <= base && base + len <= at + n);
+    if !low {
+        return None;
+    }
+    if !own {
+        split(base, len);
+    }
+    // SAFETY: a placeholder of exactly this range (just cut, or already).
+    if unsafe { VirtualFree(base as *mut c_void, 0, MEM_RELEASE) } == 0 {
+        uma_said("the placeholder could not be let go: a view of the section as before", base, len);
+        return Some(false);
+    }
+    if victory_gpu::title_memory_backed(base, len) {
+        // What the section's pages held already (DirectStorage may have
+        // filled them before they were mapped): into the heap.
+        let section = &slice.section;
+        let held = |page: usize| section.committed[page / 64].load(Ordering::Acquire) >> (page % 64) & 1 != 0;
+        let n = len / PAGE;
+        for k in 0..n {
+            if held(slice.index + k)
+                && let Some(src) = section.window(slice.index + k, 1)
+            {
+                // SAFETY: a committed page of our view of the section, and
+                // a page of the heap just mapped.
+                unsafe { std::ptr::copy_nonoverlapping(src as *const u8, (base + k * PAGE) as *mut u8, PAGE) };
+            }
+        }
+        UMA_BACKED.lock().unwrap_or_else(|e| e.into_inner()).push((base, len));
+        UMA_STATS[0].fetch_add(1, Ordering::Relaxed);
+        return Some(true);
+    }
+    UMA_STATS[1].fetch_add(1, Ordering::Relaxed);
+    // SAFETY: free address space we just let go of, made a placeholder again.
+    let again = unsafe {
+        VirtualAlloc2(
+            GetCurrentProcess(),
+            base as *const c_void,
+            len,
+            MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+            PAGE_NOACCESS,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if again as usize != base {
+        victory_loader::log_crash(&format!(
+            "VIctory: VICTORY_UMA_HEAP: the title's memory at {base:#x} (+{len:#x}) could not be reserved again after a driver heap was refused there: {}
+",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Some(false)
+}
+
+/// DirectStorage wrote bytes `[offset, offset + len)` of `pages` into their
+/// section: where those pages are shown in a driver heap ([`uma_back`]),
+/// the bytes are copied in there, since the heap is not the section.
+fn uma_written(pages: &[usize], offset: usize, len: usize) {
+    if !uma_on() || UMA_BACKED.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+        return;
+    }
+    let end = offset + len;
+    let first = offset / PAGE;
+    let Some(touched) = pages.get(first..end.div_ceil(PAGE)) else {
+        return;
+    };
+    for (i, page) in touched.iter().enumerate() {
+        let lo = if i == 0 { offset % PAGE } else { 0 };
+        let hi = (end - (first + i) * PAGE).min(PAGE);
+        for (at, bytes) in shown_at(std::slice::from_ref(page), lo, hi - lo) {
+            if !uma_backed(at, bytes) {
+                continue;
+            }
+            let slice = page_table().pages.get(page).cloned();
+            let Some(src) = slice.and_then(|s| s.section.window(s.index, 1)) else {
+                uma_said("DirectStorage wrote pages shown in a driver heap, and their section could not be read: the heap misses them", at, bytes);
+                continue;
+            };
+            // SAFETY: committed bytes of our view of the section, and title
+            // memory in a driver heap of ours.
+            unsafe { std::ptr::copy_nonoverlapping((src + lo) as *const u8, at as *mut u8, bytes) };
+            let n = UMA_STATS[2].fetch_add(1, Ordering::Relaxed) + 1;
+            let all = UMA_STATS[3].fetch_add(bytes as u64, Ordering::Relaxed) + bytes as u64;
+            if n.is_power_of_two() {
+                tracing::info!(times = n, bytes = all, "UMA heap: bytes DirectStorage wrote into the section copied into the driver heap that shows them");
+            }
+        }
+    }
 }
 
 /// Cuts `[base, base + len)` out of the placeholder it is in (which fails
