@@ -952,6 +952,11 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         crate::book::root(gpu, len);
         return Some(gpu);
     }
+    // A constant buffer off 256 bytes in the card's own memory
+    // (`crate::uma`): the list copies it there itself.
+    if let Some((_, gpu)) = u32::try_from(len).ok().and_then(|len| list.card_constants(address, len)) {
+        return Some(gpu);
+    }
     list.fill_scratch(address as *const u8, len)
 }
 
@@ -3865,6 +3870,12 @@ impl State {
                                 }
                                 None => crate::port_cbv::copied(true),
                             }
+                        }
+                        // Out of title memory in the card's own memory
+                        // (`crate::uma`): the list copies it there itself.
+                        if let Some((buffer, gpu)) = list.card_constants(address, size) {
+                            host.constant_at(index, &buffer, gpu, size);
+                            continue;
                         }
                         let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
                             host.make_null(index);

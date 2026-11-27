@@ -86,7 +86,11 @@ impl Placed {
     /// source or destination), title memory at the destination does. Gives
     /// the bytes if it took them.
     pub(super) fn prepare(&self, free: bool) -> Option<Vec<u8>> {
-        if !free && self.from.is_none() {
+        // (A source in the card's own memory that the list copies out of on
+        // the card is not read here: what the card put at the destination
+        // comes to title memory with the landing, as when flights are in
+        // the air.)
+        if self.from.is_none() && (!free || crate::uma::card_only(self.src, self.len)) {
             return None;
         }
         let mut bytes = vec![0u8; self.len];
@@ -232,8 +236,14 @@ unsafe fn wait_for_all(host: &Host, list: &ID3D12GraphicsCommandList) {
 
 /// The host copy of `[src, src + len)` if shaders write it: what it holds at
 /// a place in a list is not what title memory holds at submission.
+///
+/// Also the one that is title memory in place in the card's own memory
+/// (`crate::uma::card_only`): the card copies out of it where the list
+/// stands, as for a copy shaders write, since a read of ours there on the
+/// CPU crosses the BAR.
 fn shaders_own(src: usize, len: usize) -> Option<std::sync::Arc<Shadow>> {
-    crate::shadow::peek(src as u64, len as u64).filter(|s| s.written() && !s.in_place())
+    let card_only = crate::uma::card_only(src, len);
+    crate::shadow::peek(src as u64, len as u64).filter(|s| if s.in_place() { card_only } else { s.written() })
 }
 
 impl HostList {
@@ -301,6 +311,7 @@ impl HostList {
             from: scratch.map(|s| s.2 as usize),
         }));
         deferred.title_written();
+        self.card_scratch.lock().unwrap_or_else(|e| e.into_inner()).written_at(dst, len);
         self.changed_something();
         true
     }
