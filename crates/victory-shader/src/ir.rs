@@ -1234,6 +1234,9 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
         let Some(first) = insts.first() else { return false };
         if !(first.name() == "s_mov_b64"
             && first.writes.iter().all(|w| is_exec(&w.0))
+            // both words of the mask: an instruction reading no register (`s_mov_b64 exec, -1`)
+            // would pass the check below
+            && first.reads.len() == 2
             && first.reads.iter().all(|r| saved.contains(&r.1)))
         {
             return false;
