@@ -1375,6 +1375,9 @@ pub(crate) struct HostList {
     /// depends on ([`HostList::changed_something`]); no two lists have the
     /// same.
     epoch: std::sync::atomic::AtomicU64,
+    /// Open, reset and with nothing recorded, in a title's list whose host
+    /// side a submission took ([`HostList::spare`]).
+    spare: std::sync::atomic::AtomicBool,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -4394,6 +4397,7 @@ impl Host {
                 batch_args: Mutex::default(),
                 coming: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
+                spare: std::sync::atomic::AtomicBool::new(false),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes,
@@ -6617,7 +6621,34 @@ impl HostList {
         times
     }
 
+    /// This list, new or fresh from its reset, takes the place of one a
+    /// submission took from a title's list, and nothing records into it
+    /// before the title resets its list. It was closed for that reset, which
+    /// reset it once more: a close on the submitting thread and a reset on
+    /// the title's for every list of every frame, of a list that held
+    /// nothing (2 ms of the submitting thread's 53 a frame on the water,
+    /// profile of 2026-11-27). It stays open, and that reset finds it as it
+    /// leaves one ([`HostList::reset`]). `VICTORY_LIST_SPARE=0`: closed, as
+    /// before.
+    pub(crate) fn spare(&self) {
+        static ON: OnceLock<bool> = OnceLock::new();
+        if *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_SPARE").is_none_or(|v| v != "0")) {
+            self.spare.store(true, Ordering::Relaxed);
+        } else {
+            self.close();
+        }
+    }
+
+    /// A list still as [`HostList::spare`] left it is closed after all: the
+    /// title submits its list again, or closes it, without a reset between.
+    pub(crate) fn spare_closed(&self) {
+        if self.spare.load(Ordering::Relaxed) {
+            self.close();
+        }
+    }
+
     pub(crate) fn close(&self) {
+        self.spare.store(false, Ordering::Relaxed);
         let _closing = crate::timeline::span("closing a host list");
         self.twins_to_depth();
         self.textures_back();
@@ -6670,6 +6701,11 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
+        // Open and reset already, nothing recorded since ([`HostList::spare`]).
+        if self.spare.swap(false, Ordering::Relaxed) && self.untouched() {
+            self._alive.used();
+            return;
+        }
         self.changed_something();
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
