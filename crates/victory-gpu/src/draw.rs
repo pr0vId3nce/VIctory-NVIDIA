@@ -837,6 +837,19 @@ const LIVE_LOOKS: u8 = 120;
 /// memory is looked at again, each counted from the look before.
 const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
 
+/// After the `looks`-th unchanged look at a slot uploaded whole: the next
+/// look's number and how many frames on it is, or None: let go of. One
+/// found `changed` in place since its write is never let go of: after the
+/// last step it is looked at every last step's frames for good (a TV that
+/// shows a new video later on, where it was let go of and showed the
+/// video's first frame from then on).
+fn next_recheck(looks: u8, changed: bool) -> Option<(u8, u64)> {
+    match RECHECK_FRAMES.get(usize::from(looks) + 1) {
+        Some(&wait) => Some((looks + 1, wait)),
+        None => changed.then_some((looks, RECHECK_FRAMES[RECHECK_FRAMES.len() - 1])),
+    }
+}
+
 /// Looks at uploaded textures picked by index that found the memory as it
 /// was, and that found it changed (uploaded again), since the start.
 pub(crate) static HEAP_TEXTURES_RECHECKED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
@@ -2549,8 +2562,11 @@ impl State {
             // A slot found changed after its upload stays live (looked at
             // every frame, fingerprinted whole) across its uploads again.
             let mut live = false;
-            if let Some((at, len, print, looks, uploaded, was_live)) =
-                host.texture_slot_checked(index)
+            // Found changed in place since its write: its looks never end
+            // (`next_recheck`).
+            let mut changed = false;
+            if let Some((at, len, print, looks, uploaded, was_live, was_changed)) =
+                host.texture_slot_checked(index, write)
             {
                 if crate::texture::fingerprint_for(at, len, was_live) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
@@ -2565,28 +2581,29 @@ impl State {
                             let next = frame + 1;
                             let looks = looks + 1;
                             host.texture_slot_recheck(
-                                index, write, next, (at, len), print, looks, uploaded, true,
+                                index, write, next, (at, len), print, looks, uploaded, true, was_changed,
                             );
                         } else {
                             let print = crate::texture::fingerprint(at, len);
                             let next = frame + RECHECK_FRAMES[1];
                             host.texture_slot_recheck(
-                                index, write, next, (at, len), print, 1, uploaded, false,
+                                index, write, next, (at, len), print, 1, uploaded, false, was_changed,
                             );
                         }
                         continue;
                     }
-                    match RECHECK_FRAMES.get(usize::from(looks) + 1) {
-                        Some(wait) => {
+                    match next_recheck(looks, was_changed) {
+                        Some((looks, wait)) => {
                             host.texture_slot_recheck(
                                 index,
                                 write,
                                 frame + wait,
                                 (at, len),
                                 print,
-                                looks + 1,
+                                looks,
                                 uploaded,
                                 false,
+                                was_changed,
                             )
                         }
                         None => host.texture_slot_done(index, write, None),
@@ -2597,6 +2614,7 @@ impl State {
                     again_in = 1;
                 }
                 live = live_textures();
+                changed = true;
                 let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
                 if n < 200 || n.is_multiple_of(1000) {
                     // Whether its pages are the title's at other addresses
@@ -2770,7 +2788,7 @@ impl State {
                     Some((at, len)) => {
                         let print = crate::texture::fingerprint_for(at, len, live);
                         host.texture_slot_recheck(
-                            index, write, frame + again_in, (at, len), print, 0, frame, live,
+                            index, write, frame + again_in, (at, len), print, 0, frame, live, changed,
                         );
                     }
                     None => host.texture_slot_done(index, write, again),
@@ -2897,7 +2915,7 @@ impl State {
                 Some((at, len)) => {
                     let print = crate::texture::fingerprint_for(at, len, live);
                     host.texture_slot_recheck(
-                        index, write, frame + again_in, (at, len), print, 0, frame, live,
+                        index, write, frame + again_in, (at, len), print, 0, frame, live, changed,
                     );
                 }
                 None => host.texture_slot_done(index, write, again),
@@ -4952,7 +4970,22 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::staging_budget_per_frame;
+    use super::{next_recheck, staging_budget_per_frame};
+
+    /// The looks at a texture uploaded whole back off along the steps and
+    /// end, unless it was found changed in place: then they go on at the
+    /// last step's interval for good.
+    #[test]
+    fn only_a_texture_changed_in_place_is_looked_at_for_good() {
+        for changed in [false, true] {
+            assert_eq!(next_recheck(0, changed), Some((1, 12)));
+            assert_eq!(next_recheck(1, changed), Some((2, 40)));
+            assert_eq!(next_recheck(2, changed), Some((3, 120)));
+            assert_eq!(next_recheck(3, changed), Some((4, 400)));
+        }
+        assert_eq!(next_recheck(4, false), None);
+        assert_eq!(next_recheck(4, true), Some((4, 400)));
+    }
 
     #[test]
     fn staging_budget_scales_with_vram_budget() {

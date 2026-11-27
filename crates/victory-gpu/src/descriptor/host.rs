@@ -992,6 +992,11 @@ struct Waiting {
     /// the fingerprint it had at the upload, how many looks found it
     /// unchanged, and the frame of the upload. A fingerprint of 0: none.
     checked: (u64, u64, u64, u8, u64),
+    /// Whether a look found its texture changed in place since this write
+    /// (with nothing to tell of it): the looks at such a slot never end, it
+    /// is looked at again at their longest interval for good (a TV that
+    /// shows a new video later; `crate::draw`). A new write starts afresh.
+    changed: bool,
     /// When the slot first waited for this (`crate::host::now_ms`), for
     /// `crate::texlate`: kept over writes until it is brought up to date;
     /// and whether it waited for its memory meanwhile.
@@ -1085,7 +1090,7 @@ impl TextureQueue {
         self.writes += 1;
         let write = self.writes;
         let (since, waited, away) = self.kept(index);
-        self.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), since, waited, away });
+        self.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), changed: false, since, waited, away });
     }
 
     /// What a slot written again keeps of its wait.
@@ -1216,7 +1221,8 @@ impl TextureQueue {
     /// with fingerprint `print`: looked at again from frame `due`, for a
     /// title that fills a texture's memory after it wrote the view (the
     /// `looks`-th such look; `uploaded` is the upload's frame; `live`: one
-    /// the title keeps rewriting, see [`TextureQueue::live`]).
+    /// the title keeps rewriting, see [`TextureQueue::live`]; `changed`:
+    /// one found changed in place since its write, see `Waiting::changed`).
     #[allow(clippy::too_many_arguments)]
     fn recheck(
         &mut self,
@@ -1228,10 +1234,12 @@ impl TextureQueue {
         looks: u8,
         uploaded: u64,
         live: bool,
+        changed: bool,
     ) {
         if let Some(w) = self.same(index, write) {
             (w.due, w.looks, w.mapped) = (due, 1, 0);
             w.checked = (at.0, at.1, print, looks, uploaded);
+            w.changed = changed;
             if live {
                 self.live.insert(index);
             } else {
@@ -1240,12 +1248,15 @@ impl TextureQueue {
         }
     }
 
-    /// What [`TextureQueue::recheck`] noted of slot `index`, if it is
-    /// waiting for such a look, and whether it is live.
-    fn checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64, bool)> {
-        let (at, len, print, looks, uploaded) =
-            self.slots.get(&index).map(|w| w.checked).filter(|c| c.2 != 0)?;
-        Some((at, len, print, looks, uploaded, self.live.contains(&index)))
+    /// What [`TextureQueue::recheck`] noted of slot `index` for its write
+    /// `write`, if it is waiting for such a look, whether it is live, and
+    /// whether it was found changed in place. None too when the slot was
+    /// written again since `write` was handed out: a look taken at the old
+    /// descriptor says nothing of the new one.
+    fn checked(&self, index: u32, write: u64) -> Option<(u64, u64, u64, u8, u64, bool, bool)> {
+        let w = self.slots.get(&index).filter(|w| w.write == write && w.checked.2 != 0)?;
+        let (at, len, print, looks, uploaded) = w.checked;
+        Some((at, len, print, looks, uploaded, self.live.contains(&index), w.changed))
     }
 
     /// The memory slot `index`'s texture lies in was mapped, unmapped or
@@ -1257,7 +1268,7 @@ impl TextureQueue {
         let write = self.writes;
         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
         let (since, waited, away) = self.kept(index);
-        self.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), since, waited, away });
+        self.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), changed: false, since, waited, away });
     }
 
     /// Bytes of slot `index`'s memory that were mapped at its last upload
@@ -2032,17 +2043,19 @@ impl HostHeap {
         looks: u8,
         uploaded: u64,
         live: bool,
+        changed: bool,
     ) {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        textures.recheck(index, write, due, at, print, looks, uploaded, live);
+        textures.recheck(index, write, due, at, print, looks, uploaded, live, changed);
     }
 
     /// See [`TextureQueue::checked`].
     pub(crate) fn texture_slot_checked(
         &self,
         index: u32,
-    ) -> Option<(u64, u64, u64, u8, u64, bool)> {
-        self.textures.lock().unwrap_or_else(|e| e.into_inner()).checked(index)
+        write: u64,
+    ) -> Option<(u64, u64, u64, u8, u64, bool, bool)> {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).checked(index, write)
     }
 
     /// Nothing to upload at title slot `index` now (its memory is not
@@ -6016,20 +6029,64 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         let mut q = TextureQueue::default();
         q.written(7, 1, 0, false);
         let write = q.due(1, 10)[0].1;
-        q.recheck(7, write, 2, (0x1000, 0x2000), 5, 0, 1, true);
-        assert_eq!(q.checked(7), Some((0x1000, 0x2000, 5, 0, 1, true)));
+        q.recheck(7, write, 2, (0x1000, 0x2000), 5, 0, 1, true, true);
+        assert_eq!(q.checked(7, write), Some((0x1000, 0x2000, 5, 0, 1, true, true)));
         assert!(q.due(1, 10).is_empty(), "due again from frame 2");
         assert_eq!(q.due(2, 10), [(7, write)], "a recheck is served");
-        q.recheck(7, write, 3, (0x1000, 0x2000), 6, 1, 1, false);
-        assert_eq!(q.checked(7).map(|c| c.5), Some(false));
-        q.recheck(7, write, 3, (0x1000, 0x2000), 6, 0, 1, true);
+        q.recheck(7, write, 3, (0x1000, 0x2000), 6, 1, 1, false, true);
+        assert_eq!(q.checked(7, write).map(|c| c.5), Some(false));
+        q.recheck(7, write, 3, (0x1000, 0x2000), 6, 0, 1, true, true);
         q.done(7, write);
-        assert_eq!(q.checked(7), None);
+        assert_eq!(q.checked(7, write), None);
         assert!(q.live.is_empty(), "a slot out of the queue is not live");
         // Another write: a fresh slot, not live, whatever it was.
         q.written(7, 4, 4, false);
-        q.recheck(7, q.due(4, 10)[0].1, 5, (0x1000, 0x2000), 6, 0, 4, false);
-        assert_eq!(q.checked(7).map(|c| c.5), Some(false));
+        let write = q.due(4, 10)[0].1;
+        q.recheck(7, write, 5, (0x1000, 0x2000), 6, 0, 4, false, false);
+        assert_eq!(q.checked(7, write).map(|c| c.5), Some(false));
+    }
+
+    /// A slot found changed in place says so at every look after (its
+    /// looks then never end, `crate::draw`), until it is written again.
+    #[test]
+    fn a_slot_changed_in_place_says_so_until_it_is_written_again() {
+        let mut q = TextureQueue::default();
+        q.written(7, 1, 0, false);
+        let write = q.due(1, 10)[0].1;
+        q.recheck(7, write, 2, (0x1000, 0x2000), 5, 0, 1, false, false);
+        assert_eq!(q.checked(7, write).map(|c| c.6), Some(false), "never changed");
+        // Found changed and uploaded again, then past the last step.
+        q.recheck(7, write, 3, (0x1000, 0x2000), 6, 0, 2, false, true);
+        q.recheck(7, write, 403, (0x1000, 0x2000), 6, 4, 2, false, true);
+        assert_eq!(q.checked(7, write), Some((0x1000, 0x2000, 6, 4, 2, false, true)));
+        assert!(q.due(402, 10).is_empty());
+        assert_eq!(q.due(403, 10), [(7, write)], "still looked at after the last step");
+        // A new descriptor in the slot: nothing known of it.
+        q.written(7, 404, 404, false);
+        let new = q.due(404, 10)[0].1;
+        q.recheck(7, new, 408, (0x1000, 0x2000), 7, 0, 404, false, false);
+        assert_eq!(q.checked(7, new).map(|c| c.6), Some(false));
+    }
+
+    /// A look is taken for the write it was handed out with: once the slot
+    /// is written again, what was noted for the old write is not handed to
+    /// it, and a recheck reported for the old write changes nothing.
+    #[test]
+    fn a_late_look_at_an_old_write_is_ignored() {
+        let mut q = TextureQueue::default();
+        q.written(3, 1, 0, false);
+        let old = q.due(1, 10)[0].1;
+        q.recheck(3, old, 2, (0x1000, 0x2000), 5, 0, 1, false, true);
+        assert_eq!(q.checked(3, old).map(|c| c.2), Some(5));
+        // The title writes another view into the slot meanwhile.
+        q.written(3, 2, 2, false);
+        let new = q.due(2, 10)[0].1;
+        assert_ne!(new, old);
+        assert_eq!(q.checked(3, old), None, "the old write's look is stale");
+        assert_eq!(q.checked(3, new), None, "the new write was not uploaded yet");
+        q.recheck(3, old, 9, (0x1000, 0x2000), 5, 1, 1, false, true);
+        assert_eq!(q.checked(3, new), None, "a late recheck of the old write is dropped");
+        assert_eq!(q.due(2, 10), [(3, new)], "the new write stays due as written");
     }
 
     /// The queue of textures picked by index serves the slots looked at
