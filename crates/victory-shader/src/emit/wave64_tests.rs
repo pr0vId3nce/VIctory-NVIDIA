@@ -1399,69 +1399,6 @@ fn both_host_waves_observe_the_lds_flag_after_the_join() {
     eprintln!("all 14 flag dispatches passed on a 32-lane hardware adapter");
 }
 
-/// The two halves of a console mask keep their bit positions after a divergent branch.
-#[test]
-fn a_branch_mask_preserves_both_words_on_the_host() {
-    let body = [
-        0x7D88_0085, // v_cmp_gt_u32 vcc, 5, v0: bits 0..4
-        0xBE82_046A, // s_mov_b64 s[2:3], vcc
-        0x7D86_0001, // v_cmp_le_u32 vcc, s1, v0: lanes at or above the threshold
-        0xBE84_246A, // s_and_saveexec_b64 s[4:5], vcc
-        0xBF88_0002, // s_cbranch_execz -> join
-        0x7D88_00B7, // v_cmp_gt_u32 vcc, 55, v0: add active lanes below 55
-        0x8882_026A, // s_or_b64 s[2:3], vcc, s[2:3]
-        0x88FE_047E, // join: s_or_b64 exec, exec, s[4:5]
-        0x7E08_0202, // v_mov_b32 v4, s2
-        0x7E0A_0203, // v_mov_b32 v5, s3
-        0x3412_0083, // v_lshlrev_b32 v9, 3, v0
-        0xE070_1000, 0x8002_0409, // buffer_store_dword v4, v9, s[8:11], 0 offen
-        0xE070_1004, 0x8002_0509, // buffer_store_dword v5, v9, s[8:11], 0 offen offset:4
-    ];
-    let native = native(&body);
-    let p = crate::spill::build(&native).expect("IR");
-    let st = structure::structure(&p).expect("structure");
-    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resources");
-    let io = io::raise(&p, &native).expect("IO");
-    let container = crate::Container { digest: [0; 16], version: (1, 0), parts: Vec::new() };
-    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    let Ok(host) = Host::new(false) else {
-        eprintln!("no hardware device with SM 6.6; skipped");
-        return;
-    };
-    let (wave, _) = host.translation_caps().expect("host wave capabilities");
-    if wave < 32 {
-        eprintln!("this fixture needs at least 32 lanes per host wave; skipped");
-        return;
-    }
-    let was = lower::TEST_HOST_WAVE.replace(Some(wave));
-    let result = super::emit_with_retries(&container, &native, &p, &st, &io, &res);
-    lower::TEST_HOST_WAVE.set(was);
-    let shader = result.expect("translation");
-    let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
-    for (threshold, expected) in [
-        (0, [u32::MAX, 0x007f_ffff]), // all lanes enter
-        (32, [0x0000_001f, 0x007f_ffff]), // only the upper half enters
-        (48, [0x0000_001f, 0x007f_0000]), // only the top 16 enter
-        (64, [0x0000_001f, 0]), // no lanes enter; the old mask survives
-    ] {
-        let mut ud = vec![0; shader.user_data_dwords().max(1) as usize];
-        for u in &shader.user_data {
-            if (u.root, u.slot, u.dword) == (RootType::Constants, 0, 1) {
-                ud[u.index as usize] = threshold;
-            }
-        }
-        let out = host.dispatch(&root, &pso, &Dispatch {
-            roots: vec![(0, Root::Constants(ud))],
-            views: &[View::RawUav(128)],
-            samplers: &[],
-            groups: [1, 1, 1],
-        }).expect("dispatch");
-        for (lane, pair) in out[0][..128].chunks_exact(2).enumerate() {
-            assert_eq!(pair, expected, "threshold {threshold}, lane {lane}");
-        }
-    }
-    eprintln!("{:?}: wave{wave}; four thresholds, both words correct in all 64 lanes", host.adapter_name());
-
 /// A program every other form leaves at 64 lanes (inside its lane branch, an LDS write, a
 /// read and a second write of another value, and a scalar it sets that is read after the join,
 /// so that its skip stays) goes through [`super::emit`] on a host of 32-lane waves:
@@ -1529,4 +1466,68 @@ fn a_program_every_other_form_leaves_at_64_lanes_takes_the_wave_wide_form_last()
         let flag = if active == 0 { 0 } else { 2 + 3 };
         assert_eq!(out[0], [1 + flag; 64], "{active} active lanes");
     }
+}
+
+/// The two halves of a console mask keep their bit positions after a divergent branch.
+#[test]
+fn a_branch_mask_preserves_both_words_on_the_host() {
+    let body = [
+        0x7D88_0085, // v_cmp_gt_u32 vcc, 5, v0: bits 0..4
+        0xBE82_046A, // s_mov_b64 s[2:3], vcc
+        0x7D86_0001, // v_cmp_le_u32 vcc, s1, v0: lanes at or above the threshold
+        0xBE84_246A, // s_and_saveexec_b64 s[4:5], vcc
+        0xBF88_0002, // s_cbranch_execz -> join
+        0x7D88_00B7, // v_cmp_gt_u32 vcc, 55, v0: add active lanes below 55
+        0x8882_026A, // s_or_b64 s[2:3], vcc, s[2:3]
+        0x88FE_047E, // join: s_or_b64 exec, exec, s[4:5]
+        0x7E08_0202, // v_mov_b32 v4, s2
+        0x7E0A_0203, // v_mov_b32 v5, s3
+        0x3412_0083, // v_lshlrev_b32 v9, 3, v0
+        0xE070_1000, 0x8002_0409, // buffer_store_dword v4, v9, s[8:11], 0 offen
+        0xE070_1004, 0x8002_0509, // buffer_store_dword v5, v9, s[8:11], 0 offen offset:4
+    ];
+    let native = native(&body);
+    let p = crate::spill::build(&native).expect("IR");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resources");
+    let io = io::raise(&p, &native).expect("IO");
+    let container = crate::Container { digest: [0; 16], version: (1, 0), parts: Vec::new() };
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no hardware device with SM 6.6; skipped");
+        return;
+    };
+    let (wave, _) = host.translation_caps().expect("host wave capabilities");
+    if wave < 32 {
+        eprintln!("this fixture needs at least 32 lanes per host wave; skipped");
+        return;
+    }
+    let was = lower::TEST_HOST_WAVE.replace(Some(wave));
+    let result = super::emit_with_retries(&container, &native, &p, &st, &io, &res);
+    lower::TEST_HOST_WAVE.set(was);
+    let shader = result.expect("translation");
+    let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+    for (threshold, expected) in [
+        (0, [u32::MAX, 0x007f_ffff]), // all lanes enter
+        (32, [0x0000_001f, 0x007f_ffff]), // only the upper half enters
+        (48, [0x0000_001f, 0x007f_0000]), // only the top 16 enter
+        (64, [0x0000_001f, 0]), // no lanes enter; the old mask survives
+    ] {
+        let mut ud = vec![0; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            if (u.root, u.slot, u.dword) == (RootType::Constants, 0, 1) {
+                ud[u.index as usize] = threshold;
+            }
+        }
+        let out = host.dispatch(&root, &pso, &Dispatch {
+            roots: vec![(0, Root::Constants(ud))],
+            views: &[View::RawUav(128)],
+            samplers: &[],
+            groups: [1, 1, 1],
+        }).expect("dispatch");
+        for (lane, pair) in out[0][..128].chunks_exact(2).enumerate() {
+            assert_eq!(pair, expected, "threshold {threshold}, lane {lane}");
+        }
+    }
+    eprintln!("{:?}: wave{wave}; four thresholds, both words correct in all 64 lanes", host.adapter_name());
 }
