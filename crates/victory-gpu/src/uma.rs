@@ -470,7 +470,7 @@ mod tests {
                         let mut pages = vec![std::ptr::null_mut::<core::ffi::c_void>(); 64];
                         let (mut count, mut grain) = (pages.len(), 0u32);
                         // SAFETY: plain query with room for `count` addresses.
-                        let asked = unsafe { mem::GetWriteWatch(mem::WRITE_WATCH_FLAG_RESET, data.cast(), len, pages.as_mut_ptr(), &mut count, &mut grain) };
+                        let asked = unsafe { mem::GetWriteWatch(1 /* WRITE_WATCH_FLAG_RESET */, data.cast(), len, pages.as_mut_ptr(), &mut count, &mut grain) };
                         // SAFETY: one byte of the mapping.
                         unsafe { data.add(5 * 4096 + 7).write(1) };
                         let mut again = pages.len();
