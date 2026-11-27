@@ -3927,7 +3927,7 @@ fn late_line(frames: f64) {
     }
     card_steps::log(frames);
     crate::port::log(frames);
-    crate::uma::log();
+    crate::uma::log(frames);
     crate::port_cbv::log(frames);
     crate::watch::port_guard_line(frames);
     crate::port_journal::line(frames);
@@ -8930,7 +8930,11 @@ impl Batch {
 /// reports an unmapped page instead of faulting. Asking `VirtualQuery` first
 /// cost about 2 ms per copy in the title's big pools (it walks the page
 /// tables to the region's end), which made copies run at 100-200 MB/s.
+#[track_caller]
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
+    // Reads of title memory in a driver heap of ours, by who asked
+    // (`VICTORY_UMA_HEAP`; one compare of two numbers without it).
+    crate::uma::read_on_cpu(src as usize, len, std::panic::Location::caller());
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
         1 => {

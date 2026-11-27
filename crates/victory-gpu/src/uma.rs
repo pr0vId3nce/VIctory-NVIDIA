@@ -79,9 +79,10 @@ struct Backed {
     start: u64,
     end: u64,
     heap: ID3D12Heap,
-    /// The buffer whose mapping the title's pages are: kept, mapped, for
-    /// good (the mapping lives as long as it does).
-    _buffer: ID3D12Resource,
+    /// The buffer over the whole heap whose mapping the title's pages are:
+    /// kept, mapped, for good (the mapping lives as long as it does). What
+    /// the card copies out of the heap, it copies out of this ([`source`]).
+    buffer: ID3D12Resource,
 }
 
 // SAFETY: D3D12 objects are free-threaded.
@@ -148,7 +149,7 @@ pub fn title_memory_backed_low(len: usize, highest: usize) -> Option<usize> {
     }
     crate::host::name(&buffer, || format!("title memory {base:#x}+{len:#x} in a driver heap"));
     let mut backed = BACKED.lock().unwrap_or_else(|e| e.into_inner());
-    backed.push(Backed { start: base as u64, end: (base + len) as u64, heap, _buffer: buffer });
+    backed.push(Backed { start: base as u64, end: (base + len) as u64, heap, buffer });
     let lo = backed.iter().map(|b| b.start).min().unwrap_or(0);
     let hi = backed.iter().map(|b| b.end).max().unwrap_or(0);
     BOUNDS[0].store(lo, Ordering::Relaxed);
@@ -172,6 +173,28 @@ pub fn title_memory_backed_low(len: usize, highest: usize) -> Option<usize> {
 pub(crate) fn touches(at: usize, len: usize) -> bool {
     let hi = BOUNDS[1].load(Ordering::Relaxed);
     hi != 0 && (at as u64) < hi && (at as u64).saturating_add(len as u64) > BOUNDS[0].load(Ordering::Relaxed)
+}
+
+/// Whether `[at, at + len)` touches title memory that our code must not
+/// read on the CPU: a heap in the card's memory (`upload`), where a read
+/// through the BAR runs at about 25 MiB/s. What needs those bytes has the
+/// card copy them ([`source`]).
+pub(crate) fn card_only(at: usize, len: usize) -> bool {
+    touches(at, len) && kind() == Kind::Upload
+}
+
+/// For a copy on the card out of title memory `[start, start + len)` that
+/// lies wholly in a driver heap of ours: the buffer over that heap and the
+/// offset of `start` in it (`CopyBufferRegion`'s source; the buffer is in
+/// the common state and stays alive for the run). `None`: not ours.
+pub(crate) fn source(start: u64, len: u64) -> Option<(ID3D12Resource, u64)> {
+    let hi = BOUNDS[1].load(Ordering::Relaxed);
+    if hi == 0 || start >= hi {
+        return None;
+    }
+    let backed = BACKED.lock().unwrap_or_else(|e| e.into_inner());
+    let b = backed.iter().find(|b| b.start <= start && start + len.max(1) <= b.end)?;
+    Some((b.buffer.clone(), start - b.start))
 }
 
 /// Title memory `[start, start + len)` in place, if a driver heap of ours
@@ -217,11 +240,59 @@ pub(crate) fn place_for(start: u64, len: u64) -> Option<Placed> {
     }
 }
 
-/// For the frame-rate line.
-pub(crate) fn log() {
+/// Our own CPU reads of title memory that lies in a driver heap of ours,
+/// since the last line: by the place in our code that asked
+/// (`crate::host::copy_mapped`'s caller), how often and how many bytes.
+/// Through the BAR (`upload`) such a read runs at about 25 MiB/s, so with
+/// that heap every one of them has to go; this says which are left.
+static READS: Mutex<Vec<(&'static str, u32, u64, u64)>> = Mutex::new(Vec::new());
+
+/// All of them since the last line: how many, their bytes.
+static READ_ALL: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// A read of ours of `len` bytes at `src`, asked for at `from`: counted if
+/// it lies in a driver heap of ours.
+pub(crate) fn read_on_cpu(src: usize, len: usize, from: &'static std::panic::Location<'static>) {
+    if !touches(src, len) {
+        return;
+    }
+    READ_ALL[0].fetch_add(1, Ordering::Relaxed);
+    READ_ALL[1].fetch_add(len as u64, Ordering::Relaxed);
+    let file = from.file().rsplit(['/', '\\']).next().unwrap_or("?");
+    let mut reads = READS.lock().unwrap_or_else(|e| e.into_inner());
+    match reads.iter_mut().find(|r| r.1 == from.line() && r.0 == file) {
+        Some(r) => {
+            r.2 += 1;
+            r.3 += len as u64;
+        }
+        None => reads.push((file, from.line(), 1, len as u64)),
+    }
+}
+
+/// [`READS`], taken: the places by bytes, the largest first.
+fn reads_taken() -> (u64, u64, Vec<(&'static str, u32, u64, u64)>) {
+    let mut reads = std::mem::take(&mut *READS.lock().unwrap_or_else(|e| e.into_inner()));
+    reads.sort_by_key(|r| std::cmp::Reverse(r.3));
+    (READ_ALL[0].swap(0, Ordering::Relaxed), READ_ALL[1].swap(0, Ordering::Relaxed), reads)
+}
+
+/// For the frame-rate line; `frames` since the last one.
+pub(crate) fn log(frames: f64) {
     if kind() == Kind::Off {
         return;
     }
+    let (n, bytes, reads) = reads_taken();
+    let places: Vec<String> = reads
+        .iter()
+        .take(10)
+        .map(|(file, line, n, bytes)| format!("{file}:{line} {:.0}x {:.1} KB", *n as f64 / frames, *bytes as f64 / frames / 1024.0))
+        .collect();
+    tracing::info!(
+        "UMA heap, our own CPU reads of it per frame: {:.0} reads, {:.1} KB; by place: {}",
+        n as f64 / frames,
+        bytes as f64 / frames / 1024.0,
+        if places.is_empty() { "none".to_owned() } else { places.join(", ") }
+    );
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
     tracing::info!(
         "UMA heap (VICTORY_UMA_HEAP={:?}): {} stretches of title memory are driver heaps ({} MB); {} buffers and windows placed in them, {} not; \
