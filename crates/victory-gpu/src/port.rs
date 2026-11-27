@@ -292,7 +292,7 @@ pub(crate) fn copied(dst: usize, src: usize, len: usize) {
 /// For the frame-rate line: what is in place, and what of ours read or
 /// wrote it on the CPU per frame.
 pub(crate) fn log(frames: f64) {
-    if !on() && crate::uma::kind() == crate::uma::Kind::Off {
+    if !on() && crate::uma::kind() == crate::uma::Kind::Off && !crate::uma::uma_blocks_on() {
         return;
     }
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();

@@ -88,6 +88,10 @@ struct Backed {
 // SAFETY: D3D12 objects are free-threaded.
 unsafe impl Send for Backed {}
 
+/// The lowest start and highest end of the heaps in the card's own memory
+/// (both 0: none): what [`card_only`] goes by.
+static CARD_BOUNDS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 static BACKED: Mutex<Vec<Backed>> = Mutex::new(Vec::new());
 
 /// The lowest start and highest end of every stretch (both 0: none).
@@ -102,12 +106,14 @@ static STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 /// `highest`, free now: found by reserving it and letting it go. As high
 /// as the host gives one first (from 3 GiB on): what other threads
 /// allocate meanwhile goes to the lowest place that fits.
-fn place_below(bytes: usize, highest: usize) -> Option<usize> {
-    for lowest in [3usize << 30, K64] {
+fn place_below(bytes: usize, lowest: usize, highest: usize, align: usize) -> Option<usize> {
+    // (Memory for 32-bit addresses: from 3 GiB on first.)
+    let first = if highest <= u32::MAX as usize { (3usize << 30).max(lowest) } else { lowest };
+    for lowest in [first, lowest.max(K64)] {
         if lowest.saturating_add(bytes) > highest {
             continue;
         }
-        let mut wanted = mem::MEM_ADDRESS_REQUIREMENTS { LowestStartingAddress: lowest as *mut _, HighestEndingAddress: highest as *mut _, Alignment: 0 };
+        let mut wanted = mem::MEM_ADDRESS_REQUIREMENTS { LowestStartingAddress: lowest as *mut _, HighestEndingAddress: highest as *mut _, Alignment: align };
         // SAFETY: plain data; zero is a valid value.
         let mut parameter: mem::MEM_EXTENDED_PARAMETER = unsafe { std::mem::zeroed() };
         parameter.Anonymous1._bitfield = mem::MemExtendedParameterAddressRequirements as u64;
@@ -144,7 +150,60 @@ fn place_below(bytes: usize, highest: usize) -> Option<usize> {
 /// the hole: then the mapping lands elsewhere or is refused, and the
 /// caller reserves as before.
 pub fn title_memory_backed_behind(front: usize, len: usize, highest: usize) -> Option<usize> {
-    let kind = kind();
+    backed(kind(), front, len, (K64, highest), 0)
+}
+
+/// `VICTORY_UMA_BLOCKS=1` (off by default): the blocks of graphics memory
+/// the title commits whole (`XMemVirtualAlloc` with both processors'
+/// flags; three of 1.2 GB, 1.2 GB and 0.2 GB in Grand Theft Auto VI, where
+/// some 3,800 of its small buffers lie) are heaps of the driver's in the
+/// PC's memory, each mapped where `xmem` then gives it to the title. Title
+/// buffers and windows wholly inside one are buffers placed in its heap:
+/// no copy, no refresh, no write watch asked for them, nothing sent to the
+/// card or fetched back. What is not placed there (textures) is watched as
+/// before: the host's write watch answers for such a mapping.
+pub fn uma_blocks_on() -> bool {
+    blocks() != Blocks::Off
+}
+
+/// What `VICTORY_UMA_BLOCKS` asks for: `1` every such block in the PC's
+/// memory (measured on an RTX 4080: the card then reads every vertex and
+/// index over the bus and is the limit, 97 ms a frame against 55); `wc`
+/// only the blocks the title asks for write-combined (its CPU does not
+/// read those), in the card's own memory (`GPU_UPLOAD`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Blocks {
+    Off,
+    All,
+    WriteCombined,
+}
+
+fn blocks() -> Blocks {
+    static ASKED: std::sync::OnceLock<Blocks> = std::sync::OnceLock::new();
+    *ASKED.get_or_init(|| match std::env::var("VICTORY_UMA_BLOCKS").ok().as_deref().map(str::trim) {
+        Some("1") => Blocks::All,
+        Some("wc") => Blocks::WriteCombined,
+        _ => Blocks::Off,
+    })
+}
+
+/// A block of `len` bytes of title memory between `lowest` and `highest`,
+/// on `align` bytes (0: 64 KiB), that is a heap of the driver's
+/// ([`uma_blocks_on`]): its address. `write_combined`: the title asked for
+/// it so. `None`: nothing was made.
+pub fn title_memory_block(len: usize, lowest: usize, highest: usize, align: usize, write_combined: bool) -> Option<usize> {
+    let kind = match (blocks(), write_combined) {
+        (Blocks::All, _) => Kind::Custom,
+        (Blocks::WriteCombined, true) => Kind::Upload,
+        _ => return None,
+    };
+    backed(kind, 0, len, (lowest, highest), align)
+}
+
+/// [`title_memory_backed_behind`]'s work, for a heap of `kind` between
+/// `range.0` and `range.1` on `align` bytes.
+fn backed(kind: Kind, front: usize, len: usize, range: (usize, usize), align: usize) -> Option<usize> {
+    let (lowest, highest) = range;
     if kind == Kind::Off || len % K64 != 0 || front % K64 != 0 || len == 0 {
         return None;
     }
@@ -154,7 +213,7 @@ pub fn title_memory_backed_behind(front: usize, len: usize, highest: usize) -> O
         return None;
     }
     let took = std::time::Instant::now();
-    let place = place_below(front + len + K64, highest)?;
+    let place = place_below(front + len + K64, lowest, highest, align)?;
     let (hole, guard) = (place + front, place + front + len);
     // SAFETY (all three): reservations of address space just found free;
     // each is let go below unless it is handed on.
@@ -224,6 +283,11 @@ pub fn title_memory_backed_behind(front: usize, len: usize, highest: usize) -> O
     BOUNDS[0].store(lo, Ordering::Relaxed);
     BOUNDS[1].store(hi, Ordering::Relaxed);
     drop(backed);
+    if kind == Kind::Upload {
+        let lo = CARD_BOUNDS[0].load(Ordering::Relaxed);
+        CARD_BOUNDS[0].store(if lo == 0 { hole as u64 } else { lo.min(hole as u64) }, Ordering::Relaxed);
+        CARD_BOUNDS[1].fetch_max((hole + len) as u64, Ordering::Relaxed);
+    }
     STATS[0].fetch_add(1, Ordering::Relaxed);
     STATS[1].fetch_add(len as u64, Ordering::Relaxed);
     tracing::info!(
@@ -250,7 +314,8 @@ pub(crate) fn touches(at: usize, len: usize) -> bool {
 /// through the BAR runs at about 25 MiB/s. What needs those bytes has the
 /// card copy them ([`source`]).
 pub(crate) fn card_only(at: usize, len: usize) -> bool {
-    touches(at, len) && kind() == Kind::Upload
+    let hi = CARD_BOUNDS[1].load(Ordering::Relaxed);
+    hi != 0 && (at as u64) < hi && (at as u64).saturating_add(len as u64) > CARD_BOUNDS[0].load(Ordering::Relaxed)
 }
 
 /// For a copy on the card out of title memory `[start, start + len)` that
@@ -350,7 +415,7 @@ fn reads_taken() -> (u64, u64, Vec<(&'static str, u32, u64, u64)>) {
 
 /// For the frame-rate line; `frames` since the last one.
 pub(crate) fn log(frames: f64) {
-    if kind() == Kind::Off {
+    if kind() == Kind::Off && !uma_blocks_on() {
         return;
     }
     let (n, bytes, reads) = reads_taken();

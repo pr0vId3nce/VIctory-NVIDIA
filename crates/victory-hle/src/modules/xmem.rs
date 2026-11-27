@@ -96,14 +96,17 @@ pub extern "system" fn XMemVirtualAlloc(
     // (`VICTORY_UMA_HEAP`): there already, and nothing of the host's to
     // change.
     if !base.is_null() && uma_backed(base as usize, size.max(1)) {
-        tracing::info!(
+        static SAID: AtomicU64 = AtomicU64::new(0);
+        if SAID.fetch_add(1, Ordering::Relaxed) < 16 {
+            tracing::info!(
             at = format_args!("{:#x}", base as usize),
             size,
             kind = format_args!("{kind:#x}"),
             flags = format_args!("{flags:#x}"),
             protect = format_args!("{protect:#x}"),
-            "UMA heap: the title asks for memory inside the driver heap that is its reservation (a part of it, with its protection)"
-        );
+            "UMA heap: the title asks for memory inside a driver heap that is its own already (a part of it, with its protection)"
+            );
+        }
         return base;
     }
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
@@ -150,6 +153,25 @@ pub extern "system" fn XMemVirtualAlloc(
         if kind & MEM_RESERVE_PLACEHOLDER == 0 {
             kind |= MEM_WRITE_WATCH;
         }
+    }
+    // `VICTORY_UMA_BLOCKS`: a block of graphics memory committed whole, read
+    // and written, is a heap of the driver's in the PC's memory
+    // (`victory_gpu::title_memory_block`), which is what the title gets.
+    if constrained
+        && kind & MEM_COMMIT != 0
+        && flags & GRAPHICS == GRAPHICS
+        && flags & ADDRESS_32BIT == 0
+        && protect == PAGE_READWRITE
+        && size >= 16 * MIB
+        && size % PAGE == 0
+        && !on_wine()
+        && let Some(at) = victory_gpu::title_memory_block(size, lowest, highest, requirements.Alignment, asked & 0x400 != 0)
+    {
+        UMA_BACKED.lock().unwrap_or_else(|e| e.into_inner()).push((at, size));
+        UMA_STATS[0].fetch_add(1, Ordering::Relaxed);
+        victory_gpu::title_memory_allocated(at, size);
+        note_protection(asked, kind, flags, at, size);
+        return at as *mut c_void;
     }
     // `VICTORY_UMA_HEAP`: the title's 32-bit graphics reservation is a heap
     // of the driver's, mapped where the title may have it ([`uma_reserve`]).
@@ -1816,7 +1838,7 @@ static UMA_BACKED: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 static UMA_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 fn uma_on() -> bool {
-    static ON: LazyLock<bool> = LazyLock::new(victory_gpu::uma_heap_on);
+    static ON: LazyLock<bool> = LazyLock::new(|| victory_gpu::uma_heap_on() || victory_gpu::uma_blocks_on());
     *ON
 }
 
@@ -1840,7 +1862,7 @@ fn uma_said(what: &str, base: usize, len: usize) {
 fn uma_reserve(size: usize, highest: usize) -> Option<usize> {
     // Small reservations are not the graphics heap (185 MB in Grand Theft
     // Auto VI).
-    if !uma_on() || on_wine() || size % PAGE != 0 || size < 16 * MIB {
+    if !victory_gpu::uma_heap_on() || on_wine() || size % PAGE != 0 || size < 16 * MIB {
         return None;
     }
     // The front of the reservation stays memory of the CPU's, a
