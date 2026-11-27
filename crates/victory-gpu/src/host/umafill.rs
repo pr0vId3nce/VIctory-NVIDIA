@@ -37,7 +37,17 @@ pub(crate) struct CardScratch {
     current: usize,
     used: u64,
     made: std::collections::HashMap<(u64, u32), (usize, u64)>,
+    /// Host copies this list brings up to date on the card
+    /// ([`HostList::card_refresh`]): held until the list is reset, as a
+    /// refresh step would hold them; and the ranges done (copy, address,
+    /// bytes), each once until the list writes such memory.
+    held: Vec<std::sync::Arc<crate::shadow::Shadow>>,
+    refreshed: std::collections::HashSet<(usize, usize, usize)>,
 }
+
+// SAFETY: D3D12 resources are free-threaded, and the copies are shared
+// between threads as it is.
+unsafe impl Send for CardScratch {}
 
 /// A chunk's bytes.
 const CHUNK: u64 = 1 << 20;
@@ -59,6 +69,8 @@ impl CardScratch {
     /// The list was reset: its chunks are the next list's.
     pub(super) fn reset(&mut self) {
         self.made.clear();
+        self.held.clear();
+        self.refreshed.clear();
         (self.current, self.used) = (0, 0);
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         for chunk in self.chunks.drain(..) {
@@ -72,6 +84,7 @@ impl CardScratch {
     /// writes title memory in between.
     pub(super) fn written(&mut self) {
         self.made.clear();
+        self.refreshed.clear();
     }
 
     /// As [`CardScratch::written`], for a write of `len` bytes at `dst`:
@@ -79,8 +92,9 @@ impl CardScratch {
     /// list records thousands of buffer copies a frame, nearly all of them
     /// elsewhere).
     pub(super) fn written_at(&mut self, dst: usize, len: usize) {
-        if !self.made.is_empty() && crate::uma::touches(dst, len) {
+        if !(self.made.is_empty() && self.refreshed.is_empty()) && crate::uma::touches(dst, len) {
             self.made.clear();
+            self.refreshed.clear();
         }
     }
 
@@ -153,8 +167,62 @@ impl HostList {
     }
 }
 
+/// Since the last frame-rate line: refreshes of host copies done by a copy
+/// on the card, their bytes, and those left to the CPU because shaders
+/// write the copy or it has a side in the card's memory.
+static REFRESHES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+impl HostList {
+    /// A refresh of `[address, address + len)` of `shadow`, a host copy
+    /// that is not in place, whose title bytes lie in a heap in the card's
+    /// own memory: nothing watches that memory and a read of ours crosses
+    /// the BAR, so the list copies the bytes itself, on the card, out of
+    /// the buffer over the heap into the copy, here, where it is about to
+    /// use them. `false`: not such a copy; the caller notes a refresh step
+    /// as before.
+    ///
+    /// Not for a copy shaders write: its bytes from before are taken on the
+    /// CPU at submission, when this copy has not run, and every byte it
+    /// brings would count as written by them. Nor for one with a side in
+    /// the card's memory, whose pieces' hashes are made where changes are
+    /// sent up. Both stay on the CPU and show in the count of our reads.
+    pub(crate) fn card_refresh(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) -> bool {
+        if len == 0 || shadow.in_place() || !crate::uma::card_only(address, len) {
+            return false;
+        }
+        if shadow.written() || shadow.carded() {
+            REFRESHES[2].fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        let Some((from, offset)) = crate::uma::source(address as u64, len as u64) else {
+            return false;
+        };
+        let mut scratch = self.card_scratch.lock().unwrap_or_else(|e| e.into_inner());
+        if !scratch.refreshed.insert((std::sync::Arc::as_ptr(shadow) as usize, address, len)) {
+            return true;
+        }
+        scratch.held.push(shadow.clone());
+        drop(scratch);
+        REFRESHES[0].fetch_add(1, Ordering::Relaxed);
+        REFRESHES[1].fetch_add(len as u64, Ordering::Relaxed);
+        // SAFETY: live buffers (the list holds the copy, the heap's buffer
+        // stays for the run); the range lies in both.
+        unsafe { self.list.CopyBufferRegion(&shadow.buffer, shadow.offset(address as u64), &from, offset, len as u64) };
+        true
+    }
+}
+
 /// For the frame-rate line.
 pub(super) fn log(frames: f64) {
+    let r: Vec<f64> = REFRESHES.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    if r[0] + r[2] > 0.0 {
+        tracing::info!(
+            "UMA heap, host copies of bytes in card memory per frame: {:.1} refreshes done by a copy on the card in the list that reads them ({:.1} KB), {:.1} left              to the CPU (shaders write the copy, or it has a side on the card)",
+            r[0],
+            r[1] / 1024.0,
+            r[2]
+        );
+    }
     let s: Vec<f64> = STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     if s[0] == 0.0 {
         return;

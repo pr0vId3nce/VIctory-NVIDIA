@@ -6659,6 +6659,13 @@ impl HostList {
         let at = self.deferred().copies.len();
         let coming = aside::begin(work);
         *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = Some((at, coming));
+        // With title memory in the card's own memory (`crate::uma`) the
+        // refreshes of copies of its bytes are copies this list records
+        // ([`HostList::card_refresh`]): they have to stand in front of the
+        // draw they are for, so they are waited for here.
+        if crate::uma::kind() == crate::uma::Kind::Upload {
+            self.take_coming();
+        }
     }
 
     /// The refreshes that were still to come are put among the steps.
@@ -6667,6 +6674,10 @@ impl HostList {
             return;
         };
         let found = coming.wait();
+        // (Those of bytes in the card's own memory: copied on the card, by
+        // the list, here.)
+        let found: Vec<aside::Refresh> =
+            found.into_iter().filter(|(shadow, from, to)| !self.card_refresh(shadow, *from as usize, (*to - *from) as usize)).collect();
         let mut deferred = self.deferred();
         let at = at.min(deferred.copies.len());
         deferred
@@ -7343,6 +7354,11 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
+        // Bytes in the card's own memory (`crate::uma`): copied on the card,
+        // here, by the list itself.
+        if self.card_refresh(shadow, address, len) {
+            return;
+        }
         let mut deferred = self.deferred();
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.refreshed.insert(key) {
