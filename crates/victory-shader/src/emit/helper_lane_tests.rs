@@ -269,6 +269,17 @@ fn pixel_dpp_respects_exec_fetch_inactive_and_bound_control() {
 }
 
 #[test]
+fn pixel_wqm_expands_exec_only_in_quads_with_live_lanes() {
+    let mut words: Vec<_> = (2..6).map(|dst| mov(dst, 128)).collect();
+    narrow_exec(&mut words);
+    words.extend([WQM, mov(2, 242), RESTORE_EXEC]);
+    render("wqm-exec", &words, |x, _| {
+        [if x < 8 { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0]
+    })
+    .unwrap();
+}
+
+#[test]
 fn pixel_dpp8_and_ds_swizzle_agree_on_inactive_sources() {
     let mut words = vec![WQM];
     words.extend((2..6).map(|dst| mov(dst, 242)));

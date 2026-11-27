@@ -4645,9 +4645,16 @@ impl<'a> Lower<'a> {
                 self.pending_masks.push((v, b, i));
                 Ok(v)
             }
-            // shortcut: "some lane of the quad is set" is taken as true: the
-            // lanes it adds only feed derivatives, and exports keep their own
-            // masks. Wrong if such a section had a side effect.
+            // Some lane of the quad has the mask: made where the mask is written
+            // (`pixel_quad_mask`), the `s_wqm` or the live lanes it reads.
+            Atom::Quad(v) if self.s.pixel => self.lane_bits.get(&v).copied().ok_or_else(|| {
+                self.lane_fail
+                    .get(&v)
+                    .copied()
+                    .unwrap_or("a pixel whole-quad mask without its defining instruction")
+            }),
+            // shortcut: outside pixel programs "some lane of the quad is set" is
+            // taken as true.
             Atom::Quad(_) => Ok(self.s.m.bool(true)),
             // With console lanes, a mask held as a number is the console's:
             // the lane tests its own bit.
@@ -5419,6 +5426,30 @@ impl<'a> Lower<'a> {
         r.unwrap_or(x)
     }
 
+    /// Whether some lane of this lane's quad has `input` (a pixel program's whole-quad mode):
+    /// the lane's bit, or'ed with its neighbours' across x and then across y.
+    fn pixel_quad_mask(&mut self, input: Bool) -> Result<V, Why> {
+        let c = self.cur;
+        let on = self.boolean(input, c)?;
+        if input == Bool::TRUE || input == Bool::FALSE {
+            return Ok(on);
+        }
+        self.s.flags |= flags::WAVE_OPS;
+        let i32t = self.s.t.i32;
+        let bits = self.s.m.cast(c, Cast::ZExt, on, i32t);
+        let mut any = bits;
+        // QuadReadAcrossX (0), then Y (1).
+        for kind in 0..2 {
+            let kind = self.s.m.i8(kind);
+            let other = self
+                .s
+                .op(c, "quadOp.i32", Attr::NoUnwind, i32t, 123, &[any, kind]);
+            any = self.s.m.bin(c, Bin::Or, any, other);
+        }
+        let zero = self.s.m.i32(0);
+        Ok(self.s.m.cmp(c, pred::NE, any, zero))
+    }
+
     /// `x` of lane `src` of this lane's quad: by `lanes` when every quad takes the same
     /// pattern, else lane by lane ([`Self::quad_pick`]).
     fn quad_from(&mut self, x: V, src: V, lanes: Option<[u8; 4]>) -> V {
@@ -6161,6 +6192,21 @@ impl<'a> Lower<'a> {
             _ => None,
         };
         let lo = dst_code.and_then(|c| inst.write(Reg::S(c)));
+        // A mask whose quads a pixel program's whole-quad mode takes (`Atom::Quad`): which
+        // quads have a lane of it, here where it is written.
+        if self.s.pixel
+            && let Some(v) = lo
+            && let Some(&input) = self.x.st.quad_inputs.get(&v)
+        {
+            match self.pixel_quad_mask(input) {
+                Ok(m) => {
+                    self.lane_bits.insert(v, m);
+                }
+                Err(why) => {
+                    self.lane_fail.insert(v, why);
+                }
+            }
+        }
         if inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) {
             return Err(LANE_MASK);
         }

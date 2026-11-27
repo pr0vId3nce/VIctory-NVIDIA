@@ -44,7 +44,9 @@ pub enum Atom {
     Uniform(Value),
     /// A lane mask joined at a block entry, by its low dword's phi.
     Phi(Value),
-    /// `s_wqm` result: some lane of the quad is in the source mask.
+    /// Some lane of the quad is in a mask: an `s_wqm` result's widening, by its value, or a
+    /// pixel program's live lanes that `s_wqm` reads (killed lanes going on with their quad),
+    /// by that mask's value. [`Structured::quad_inputs`] holds the mask.
     Quad(Value),
     /// A mask the pass cannot see into (loaded, built from scalars, an
     /// EXEC write it does not follow): the lane's bit of the register pair
@@ -445,6 +447,9 @@ pub struct Structured {
     /// SCC values a mask operation sets when some lane's bit of its result is set, with that
     /// lane bit: as data such an SCC is "some lane of the wave has it".
     pub scc_some: HashMap<Value, Bool>,
+    /// For each [`Atom::Quad`], by its value: the lane's bit of the mask whose quads it is
+    /// (some lane of the quad has it).
+    pub quad_inputs: HashMap<Value, Bool>,
 }
 
 impl Structured {
@@ -557,6 +562,8 @@ struct Lanes<'a> {
     wave_any: Vec<Option<bool>>,
     /// Mask values an `s_wqm` reads: a pixel program's live lanes, whose quads go on.
     quad_sources: HashSet<Value>,
+    /// See [`Structured::quad_inputs`].
+    quad_inputs: Map<Value, Bool>,
 }
 
 /// A mask join taken as `value` in every lane that reaches `block`: each
@@ -647,6 +654,7 @@ impl<'a> Lanes<'a> {
             scc_every: HashSet::new(),
             wave_any: vec![None; blocks.len()],
             quad_sources,
+            quad_inputs: Map::default(),
         })
     }
 
@@ -664,6 +672,7 @@ impl<'a> Lanes<'a> {
         self.first.fill(Bool::FALSE);
         self.when.fill(None);
         self.active.clear();
+        self.quad_inputs.clear();
     }
 
     /// Lane masks, branch conditions and forward-edge knowledge, block by
@@ -898,6 +907,7 @@ impl<'a> Lanes<'a> {
                 .map(|(&scc, &m)| (scc, m))
                 .collect(),
             phi_masks,
+            quad_inputs: self.quad_inputs.into_iter().collect(),
             bools: self.b,
             exits,
             guards,
@@ -1129,6 +1139,7 @@ impl<'a> Lanes<'a> {
                 let lo = dst.or(exec_out)?.0;
                 let born = self.born(lo);
                 let q = self.b.atom(Atom::Quad(lo), born);
+                self.quad_inputs.insert(lo, a);
                 let r = self.b.or(a, q);
                 (r, Some(r))
             }
@@ -1254,12 +1265,13 @@ impl<'a> Lanes<'a> {
                         // `s_wqm` widens again: a lane whose own bit is clear goes on with its
                         // quad (a helper that computes what the quad reads, not only
                         // derivatives), so "no lane is set" is not its own bit's answer.
-                        if let Some((k, _)) = r.dst
+                        if let Some((k, live)) = r.dst
                             && self.quad_sources.contains(&k.0)
                             && LIVE_QUADS.get()
                         {
                             let born = self.born(k.0);
                             let q = self.b.atom(Atom::Quad(k.0), born);
+                            self.quad_inputs.insert(k.0, live);
                             m = self.b.or(m, q);
                         }
                         self.scc_lane.insert(scc, m);
@@ -1755,6 +1767,8 @@ mod tests {
             let support = s.bools.support(when);
             let quad = support.iter().any(|a| matches!(a, Atom::Quad(_)));
             assert_eq!(quad, wqm, "s_wqm {wqm}");
+            // Each quad atom names its mask: the live lanes (s76) and the s_wqm result.
+            assert_eq!(s.quad_inputs.len(), if wqm { 2 } else { 0 });
             // The second try of a program that does not translate so: the lane's own bit.
             let s = without_live_quads(|| structure(&p)).unwrap();
             let LaneExit::Branch { when, .. } = s.exits[0] else {
@@ -1762,6 +1776,7 @@ mod tests {
             };
             let support = s.bools.support(when);
             assert!(!support.iter().any(|a| matches!(a, Atom::Quad(_))));
+            assert_eq!(s.quad_inputs.len(), usize::from(wqm));
         }
     }
 
