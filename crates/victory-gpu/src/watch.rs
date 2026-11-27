@@ -3688,7 +3688,7 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 pub fn title_memory_remapped(at: usize, len: usize) {
     forget_holes(at, len);
     crate::texback::remapped(at, len);
-    open(&mut title_memory_changed(at, len), at, at.saturating_add(len));
+    open(&title_memory_changed(at, len), at, at.saturating_add(len));
 }
 
 /// The runtime is about to unmap title memory `[at, at + len)`: it is
