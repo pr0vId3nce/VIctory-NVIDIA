@@ -92,6 +92,12 @@ pub extern "system" fn XMemVirtualAlloc(
     protect: u32,
 ) -> *mut c_void {
     let (lowest, highest) = address_range(flags);
+    // Inside title memory that is a heap of the driver's
+    // (`VICTORY_UMA_HEAP`): there already, and nothing of the host's to
+    // change.
+    if !base.is_null() && uma_backed(base as usize, size.max(1)) {
+        return base;
+    }
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
         LowestStartingAddress: lowest as *mut c_void,
         HighestEndingAddress: highest as *mut c_void,
@@ -136,6 +142,16 @@ pub extern "system" fn XMemVirtualAlloc(
         if kind & MEM_RESERVE_PLACEHOLDER == 0 {
             kind |= MEM_WRITE_WATCH;
         }
+    }
+    // `VICTORY_UMA_HEAP`: the title's 32-bit graphics reservation is a heap
+    // of the driver's, mapped where the title may have it ([`uma_reserve`]).
+    if constrained
+        && kind & MEM_COMMIT == 0
+        && flags & ADDRESS_32BIT != 0
+        && let Some(at) = uma_reserve(size, highest)
+    {
+        note_protection(asked, kind, flags, at, size);
+        return at as *mut c_void;
     }
     // SAFETY: the title's own arguments, cleaned of console bits; the
     // parameter points at `requirements`, which outlives the call.
@@ -1758,22 +1774,12 @@ mod pool {
 /// must lie in one placeholder.
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     if uma_backed(base, len) {
-        // The title maps pages again where a driver heap of ours is: what it
-        // shows stays the heap's (`victory_gpu::title_memory_backed`).
-        uma_said("the title maps physical pages again over title memory that is a driver heap: left as it was", base, len);
+        // A heap of the driver's is the title's memory here: the pages are
+        // only noted, and what they hold already goes into it.
+        uma_show(base, len, &slice);
         return true;
     }
-    let mut own = physical.holes.remove(&base) == Some(len) && lean();
-    match uma_back(base, len, &slice, own) {
-        Some(true) => {
-            shown_mut().note(base, len, &slice);
-            victory_gpu::title_memory_remapped(base, len);
-            return true;
-        }
-        // A placeholder of exactly this range again.
-        Some(false) => own = true,
-        None => {}
-    }
+    let own = physical.holes.remove(&base) == Some(len) && lean();
     if !show(base, len, &slice, own) {
         return false;
     }
@@ -1789,16 +1795,16 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     true
 }
 
-/// `VICTORY_UMA_HEAP` (`victory_gpu::uma_heap_on`): pages the title maps
-/// into its 32-bit graphics reservation ([`LOW_RESERVATIONS`]) become a
-/// heap of the driver's mapped at the same address, instead of a view of
-/// the section, so the card reads and writes the title's bytes as the
-/// driver's own memory (on NVIDIA much faster than a heap opened on title
-/// pages). The stretches backed so far.
+/// `VICTORY_UMA_HEAP` (`victory_gpu::uma_heap_on`): the title's 32-bit
+/// graphics reservation is a heap of the driver's, mapped below 4 GiB by
+/// the driver, instead of a placeholder that views of the page pool's
+/// section are mapped into: the card reads and writes the title's bytes as
+/// the driver's own memory (on NVIDIA much faster than a heap opened on
+/// title pages). The reservations made so ([`uma_reserve`]).
 static UMA_BACKED: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 
-/// Since the start: stretches backed, asks that fell back, pages put into
-/// them after DirectStorage wrote their section, bytes of it.
+/// Since the start: reservations made so, asks that fell back, pieces put
+/// into them after DirectStorage wrote their section, bytes of them.
 static UMA_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 fn uma_on() -> bool {
@@ -1806,7 +1812,7 @@ fn uma_on() -> bool {
     *ON
 }
 
-/// Whether `[base, base + len)` touches a stretch [`uma_back`] backed.
+/// Whether `[base, base + len)` touches memory [`uma_reserve`] made.
 fn uma_backed(base: usize, len: usize) -> bool {
     uma_on() && UMA_BACKED.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(at, n)| at < base + len && base < at + n)
 }
@@ -1819,70 +1825,60 @@ fn uma_said(what: &str, base: usize, len: usize) {
     }
 }
 
-/// [`map`]'s part for [`UMA_BACKED`]: `None` if not asked for here (the
-/// placeholder untouched); `Some(true)` if `[base, base + len)` is now a
-/// driver heap holding what the section's pages held; `Some(false)` if
-/// that was refused and the range is a placeholder of its own again.
-fn uma_back(base: usize, len: usize, slice: &Slice, own: bool) -> Option<bool> {
-    if !uma_on() || on_wine() {
+/// The title reserves `size` bytes of 32-bit graphics memory: a heap of
+/// the driver's mapped below `highest`, if the switch asks for one and the
+/// host gives it; its address is the title's reservation. `None`: a
+/// reservation as before.
+fn uma_reserve(size: usize, highest: usize) -> Option<usize> {
+    // Small reservations are not the graphics heap (185 MB in Grand Theft
+    // Auto VI).
+    if !uma_on() || on_wine() || size % PAGE != 0 || size < 16 * MIB {
         return None;
     }
-    let low = LOW_RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(at, n)| at <= base && base + len <= at + n);
-    if !low {
+    let Some(at) = victory_gpu::title_memory_backed_low(size, highest) else {
+        UMA_STATS[1].fetch_add(1, Ordering::Relaxed);
         return None;
-    }
-    if !own {
-        split(base, len);
-    }
-    // SAFETY: a placeholder of exactly this range (just cut, or already).
-    if unsafe { VirtualFree(base as *mut c_void, 0, MEM_RELEASE) } == 0 {
-        uma_said("the placeholder could not be let go: a view of the section as before", base, len);
-        return Some(false);
-    }
-    if victory_gpu::title_memory_backed(base, len) {
-        // What the section's pages held already (DirectStorage may have
-        // filled them before they were mapped): into the heap.
-        let section = &slice.section;
-        let held = |page: usize| section.committed[page / 64].load(Ordering::Acquire) >> (page % 64) & 1 != 0;
-        let n = len / PAGE;
-        for k in 0..n {
-            if held(slice.index + k)
-                && let Some(src) = section.window(slice.index + k, 1)
-            {
-                // SAFETY: a committed page of our view of the section, and
-                // a page of the heap just mapped.
-                unsafe { std::ptr::copy_nonoverlapping(src as *const u8, (base + k * PAGE) as *mut u8, PAGE) };
-            }
-        }
-        UMA_BACKED.lock().unwrap_or_else(|e| e.into_inner()).push((base, len));
-        UMA_STATS[0].fetch_add(1, Ordering::Relaxed);
-        return Some(true);
-    }
-    UMA_STATS[1].fetch_add(1, Ordering::Relaxed);
-    // SAFETY: free address space we just let go of, made a placeholder again.
-    let again = unsafe {
-        VirtualAlloc2(
-            GetCurrentProcess(),
-            base as *const c_void,
-            len,
-            MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
-            PAGE_NOACCESS,
-            std::ptr::null_mut(),
-            0,
-        )
     };
-    if again as usize != base {
-        victory_loader::log_crash(&format!(
-            "VIctory: VICTORY_UMA_HEAP: the title's memory at {base:#x} (+{len:#x}) could not be reserved again after a driver heap was refused there: {}
-",
-            std::io::Error::last_os_error()
-        ));
+    UMA_BACKED.lock().unwrap_or_else(|e| e.into_inner()).push((at, size));
+    UMA_STATS[0].fetch_add(1, Ordering::Relaxed);
+    Some(at)
+}
+
+/// The ranges of [`UMA_BACKED`] memory the title has mapped pages at.
+static UMA_SHOWN: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+/// [`map`]'s part for [`UMA_BACKED`] memory: the title maps `slice`'s pages
+/// at `[base, base + len)`, which is a heap of the driver's and stays one.
+/// What the section's pages hold already (DirectStorage may have filled
+/// them before they were mapped) is copied in, and the pages are noted as
+/// shown there, for [`uma_written`].
+fn uma_show(base: usize, len: usize, slice: &Slice) {
+    {
+        let mut shown = UMA_SHOWN.lock().unwrap_or_else(|e| e.into_inner());
+        if shown.iter().any(|&(at, n)| at < base + len && base < at + n) {
+            // shortcut: the pages mapped there before are still noted, and
+            // the bytes stay the heap's (the title's graphics heap is
+            // mapped once and kept).
+            uma_said("the title maps physical pages a second time over title memory that is a driver heap: its bytes stay as they are", base, len);
+        }
+        shown.push((base, len));
     }
-    Some(false)
+    let section = &slice.section;
+    let held = |page: usize| section.committed[page / 64].load(Ordering::Acquire) >> (page % 64) & 1 != 0;
+    for k in 0..len / PAGE {
+        if held(slice.index + k)
+            && let Some(src) = section.window(slice.index + k, 1)
+        {
+            // SAFETY: a committed page of our view of the section, and a
+            // page of the heap's mapping.
+            unsafe { std::ptr::copy_nonoverlapping(src as *const u8, (base + k * PAGE) as *mut u8, PAGE) };
+        }
+    }
+    shown_mut().note(base, len, slice);
 }
 
 /// DirectStorage wrote bytes `[offset, offset + len)` of `pages` into their
-/// section: where those pages are shown in a driver heap ([`uma_back`]),
+/// section: where those pages are shown in a driver heap ([`uma_show`]),
 /// the bytes are copied in there, since the heap is not the section.
 fn uma_written(pages: &[usize], offset: usize, len: usize) {
     if !uma_on() || UMA_BACKED.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
@@ -2176,6 +2172,14 @@ pub extern "system" fn XMemTransferMemory(kind: u32, size: usize) -> BOOL {
 /// first: the address may be other memory's the moment it is free.
 extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u32) -> BOOL {
     const MEM_COALESCE_PLACEHOLDERS: u32 = 1;
+    // Title memory that is a heap of the driver's (`VICTORY_UMA_HEAP`) has
+    // no placeholders to split or join, and is never given back.
+    if uma_backed(address as usize, size.max(1)) {
+        if kind & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) == 0 {
+            uma_said("the title frees title memory that is a driver heap: left as it is", address as usize, size);
+        }
+        return 1;
+    }
     // Splitting and joining placeholders changes nothing they show.
     if kind & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) == 0 {
         victory_gpu::title_memory_freed(address as usize, size);

@@ -270,7 +270,7 @@ pub(crate) fn forget(at: usize, len: usize) {
 /// Whether `[at, at + len)` touches ported memory (a quick look).
 fn touches(at: usize, len: usize) -> bool {
     let hi = BOUNDS[1].load(Ordering::Relaxed);
-    hi != 0 && (at as u64) < hi && (at as u64).saturating_add(len as u64) > BOUNDS[0].load(Ordering::Relaxed)
+    hi != 0 && (at as u64) < hi && (at as u64).saturating_add(len as u64) > BOUNDS[0].load(Ordering::Relaxed) || crate::uma::touches(at, len)
 }
 
 /// A fill of upload memory read `len` bytes at `src` on the CPU.
@@ -292,13 +292,13 @@ pub(crate) fn copied(dst: usize, src: usize, len: usize) {
 /// For the frame-rate line: what is in place, and what of ours read or
 /// wrote it on the CPU per frame.
 pub(crate) fn log(frames: f64) {
-    if !on() {
+    if !on() && crate::uma::kind() == crate::uma::Kind::Off {
         return;
     }
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
     let per: Vec<f64> = STATS[9..].iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
-        "renderer port 1 (VICTORY_PORT_CONSTANTS=1): {} regions of the title's graphics memory in place ({} MB), {} title buffers and windows placed in them \
+        "renderer port 1 (VICTORY_PORT_CONSTANTS=1; with VICTORY_UMA_HEAP its memory is in the CPU counts): {} regions of the title's graphics memory in place ({} MB), {} title buffers and windows placed in them \
          (no host copy, nothing sent up or fetched back for them); per frame on the CPU: {:.0} fills read out of them ({:.1} KB), {:.1} buffer copies \
          touching them ({:.1} KB); since the start refused: {} not one stretch of a section, {} not committed, {} by the host, {} no buffer; {} regions \
          forgotten (other pages mapped there)",

@@ -7,30 +7,34 @@
 //! on such imported pages are about ten times slower than on a heap the
 //! driver allocates itself (xcl-dev/xcl #2844's probe), which is why port 1
 //! made the card slower on the RTX 4080 (19 to 32 ms). Here the pages are
-//! the driver's instead: when the title maps physical pages into its 32-bit
-//! graphics reservation, `xmem` lets go of the placeholder there and asks
-//! [`title_memory_backed`] for a heap of that size whose CPU mapping lands
-//! on the same address. Every other free stretch of the address space big
-//! enough to take the mapping is reserved for a moment ("grooming", as
-//! xcl's #2844 does), so the driver's `Map` can only land in the hole. The
-//! title then writes the driver's memory and the card reads it; title
-//! buffers and windows in it are buffers placed in that heap
-//! ([`place_for`], through `crate::port::place_for`), with no copy, no
-//! refresh, no write watch and nothing fetched back, as port 1's are.
+//! the driver's instead: when the title reserves its 32-bit graphics
+//! memory (one reservation of 185 MB, right after the device is made),
+//! `xmem` asks [`title_memory_backed_low`] for a heap of that size whose
+//! CPU mapping lies below 4 GiB, and gives the title that mapping's address
+//! as its reservation. The title then writes the driver's memory and the
+//! card reads it; title buffers and windows in it are buffers placed in
+//! that heap ([`place_for`], through `crate::port::place_for`), with no
+//! copy, no refresh, no write watch and nothing fetched back, as port 1's
+//! are.
 //!
 //! The heap is, by the switch:
 //! - `upload`: `D3D12_HEAP_TYPE_GPU_UPLOAD`, the card's own memory written
 //!   by the CPU through the resizable BAR (xcl #2938's mixed segments). The
-//!   card reads it at its own speed; a CPU *read* crosses the bus uncached
-//!   (12-84 MiB/s measured there).
+//!   card reads it at its own speed; the CPU writes it at about 2.5 GiB/s
+//!   and READS it at about 25 MiB/s (RTX 4080, driver 610.88).
 //! - `custom`: a custom heap in the PC's memory, write-back, pool L0, with
-//!   write watching (xcl #2844): the CPU reads it at full speed, the card
-//!   over the bus, but as fast as a heap of the driver's.
+//!   write watching (xcl #2844): the CPU reads and writes it at full speed,
+//!   the card over the bus, but as a heap of the driver's.
+//!
+//! Left alone the driver maps either high, so every free stretch above
+//! 4 GiB that could take the mapping is reserved for the moment of the
+//! call ("grooming", as xcl's #2844 does), and it can only land below.
+//! Which address below does not matter: the title is given the one it got.
 //!
 //! What it assumes is what port 1 assumes: what our CPU steps read there
-//! at submission is what the title's CPU wrote. And: the title maps those
-//! pages once and keeps them (port 1's notes: never tile-mapped, never
-//! remapped). `xmem` warns if it does otherwise.
+//! at submission is what the title's CPU wrote. And: the title maps
+//! physical pages there once and keeps them (port 1's notes: never
+//! tile-mapped, never remapped); `xmem` leaves later mappings there alone.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -89,30 +93,31 @@ static BACKED: Mutex<Vec<Backed>> = Mutex::new(Vec::new());
 static BOUNDS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// Since the start: stretches backed and their bytes; asks where the
-/// mapping landed elsewhere; asks the host refused; buffers and windows
+/// mapping landed where the title cannot have it; asks the host refused; buffers and windows
 /// placed in them; stretches groomed and the reservations that took.
 static STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
-/// The title's `[base, base + len)` (64 KiB aligned, free: the caller let
-/// go of the placeholder there) as a heap of the driver's, mapped at
-/// `base`. `false`: nothing was made and the range is free again, for the
-/// caller to reserve and map as before.
-pub fn title_memory_backed(base: usize, len: usize) -> bool {
+/// A heap of the driver's of `len` bytes (a multiple of 64 KiB) whose CPU
+/// mapping ends at or below `highest`: the mapping's address, for the
+/// caller to give the title as its memory. `None`: nothing was made.
+pub fn title_memory_backed_low(len: usize, highest: usize) -> Option<usize> {
     let kind = kind();
-    if kind == Kind::Off || base % K64 != 0 || len % K64 != 0 || len == 0 {
-        return false;
+    if kind == Kind::Off || len % K64 != 0 || len == 0 {
+        return None;
     }
-    let Some(host) = crate::host::host() else {
-        return false;
-    };
+    let host = crate::host::host()?;
     if kind == Kind::Upload && !host.mapped_card_memory() {
         warn_once("VICTORY_UMA_HEAP=upload: this PC offers no GPU_UPLOAD heaps (resizable BAR); title memory stays as it was");
-        return false;
+        return None;
     }
     let took = std::time::Instant::now();
-    let groomed = groom(base, len);
+    // Left alone the driver maps either kind high in the title's process
+    // (the card's memory at the lowest free address in a small one, never
+    // here): only below `highest` is anything left that can take it.
+    let groomed = groom(0, highest.saturating_add(1), len);
     STATS[6].fetch_add(1, Ordering::Relaxed);
     STATS[7].fetch_add(groomed.len() as u64, Ordering::Relaxed);
+    let groom_ms = took.elapsed().as_secs_f64() * 1000.0;
     let made = make(&host.device, kind, len as u64);
     for at in &groomed {
         // SAFETY: our own reservations, nothing in them.
@@ -122,25 +127,24 @@ pub fn title_memory_backed(base: usize, len: usize) -> bool {
         Ok(made) => made,
         Err(e) => {
             STATS[3].fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(base = format_args!("{base:#x}"), len, error = %e, ?kind, "UMA heap: the host refused the heap; title memory as before");
-            return false;
+            tracing::warn!(len, error = %e, ?kind, "UMA heap: the host refused the heap; title memory as before");
+            return None;
         }
     };
-    if data as usize != base {
+    let base = data as usize;
+    if base == 0 || base % K64 != 0 || base.saturating_add(len - 1) > highest {
         STATS[2].fetch_add(1, Ordering::Relaxed);
         tracing::warn!(
-            base = format_args!("{base:#x}"),
             len,
-            landed = format_args!("{:#x}", data as usize),
+            landed = format_args!("{base:#x}"),
+            highest = format_args!("{highest:#x}"),
             groomed = groomed.len(),
             ?kind,
-            "UMA heap: the driver mapped the heap elsewhere; title memory as before"
+            "UMA heap: the driver mapped the heap where the title cannot have it; title memory as before"
         );
         // SAFETY: our own buffer, mapped once.
         unsafe { buffer.Unmap(0, None) };
-        drop(buffer);
-        drop(heap);
-        return false;
+        return None;
     }
     crate::host::name(&buffer, || format!("title memory {base:#x}+{len:#x} in a driver heap"));
     let mut backed = BACKED.lock().unwrap_or_else(|e| e.into_inner());
@@ -157,20 +161,17 @@ pub fn title_memory_backed(base: usize, len: usize) -> bool {
         len,
         ?kind,
         groomed = groomed.len(),
+        groom_ms,
         ms = took.elapsed().as_secs_f64() * 1000.0,
-        "UMA heap: title memory is a driver heap at the title's address (no copy, no refresh, nothing fetched back)"
+        "UMA heap: title memory is a driver heap, mapped where the title has it (no copy, no refresh, nothing fetched back)"
     );
-    true
+    Some(base)
 }
 
-/// Whether `[at, at + len)` lies in a driver heap of ours.
-pub fn title_memory_in_uma_heap(at: usize, len: usize) -> bool {
-    let (at, end) = (at as u64, at as u64 + len.max(1) as u64);
+/// Whether `[at, at + len)` touches a driver heap of ours (a quick look).
+pub(crate) fn touches(at: usize, len: usize) -> bool {
     let hi = BOUNDS[1].load(Ordering::Relaxed);
-    if hi == 0 || at >= hi || end <= BOUNDS[0].load(Ordering::Relaxed) {
-        return false;
-    }
-    BACKED.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|b| b.start < end && at < b.end)
+    hi != 0 && (at as u64) < hi && (at as u64).saturating_add(len as u64) > BOUNDS[0].load(Ordering::Relaxed)
 }
 
 /// Title memory `[start, start + len)` in place, if a driver heap of ours
@@ -287,14 +288,24 @@ fn make(device: &ID3D12Device, kind: Kind, size: u64) -> windows::core::Result<(
     Ok((heap, buffer, data.cast()))
 }
 
-/// Reserves every free stretch of the address space that a mapping of
-/// `len` bytes could take, other than `[base, base + len)`, keeping a
-/// little at the start of each for the driver's own small mappings: the
-/// reservations' addresses, for the caller to release.
-fn groom(base: usize, len: usize) -> Vec<usize> {
+/// Reserves every free stretch of the address space outside `[lo, hi)`
+/// that a mapping of `len` bytes could take, keeping a little at the start
+/// of each for the driver's own small mappings, and whatever free space
+/// touches `[lo, hi)` from outside (so that a mapping cannot lie across its
+/// edge): the reservations' addresses, for the caller to release.
+fn groom(lo: usize, hi: usize, len: usize) -> Vec<usize> {
     // Less than the mapping, so that it cannot land there.
-    let headroom = (len / 4).min(16 << 20).next_multiple_of(K64).min(len - K64.min(len));
+    let headroom = (len / 4).min(16 << 20).next_multiple_of(K64).min(len.saturating_sub(K64));
     let mut out = Vec::new();
+    let mut reserve = |a: usize, b: usize| {
+        if b > a {
+            // SAFETY: reserves free address space, no pages.
+            let at = unsafe { mem::VirtualAlloc(a as *const _, b - a, mem::MEM_RESERVE, mem::PAGE_NOACCESS) };
+            if !at.is_null() {
+                out.push(at as usize);
+            }
+        }
+    };
     let mut here = K64;
     // The highest user address on x64 Windows.
     const TOP: usize = 0x7fff_ffff_0000;
@@ -305,30 +316,28 @@ fn groom(base: usize, len: usize) -> Vec<usize> {
         if unsafe { mem::VirtualQuery(here as *const _, &mut info, size_of_val(&info)) } == 0 {
             break;
         }
-        let start = info.BaseAddress as usize;
-        let end = start.saturating_add(info.RegionSize);
-        if info.State == mem::MEM_FREE && !(start <= base && base + len <= end && end - start == len) {
+        let from = info.BaseAddress as usize;
+        let to = from.saturating_add(info.RegionSize);
+        if info.State == mem::MEM_FREE {
             // Free stretches start on 64 KiB lines (the allocation grain).
-            let from = (start + headroom).next_multiple_of(K64);
-            let to = end & !(K64 - 1);
-            if to > from && to - start >= len {
-                // A free stretch that holds the hole and more: keep the
-                // hole free, take what lies around it.
-                for (a, b) in [(from, to.min(base)), (from.max(base + len), to)] {
-                    if b > a && b - a >= K64 {
-                        // SAFETY: reserves free address space, no pages.
-                        let at = unsafe { mem::VirtualAlloc(a as *const _, b - a, mem::MEM_RESERVE, mem::PAGE_NOACCESS) };
-                        if !at.is_null() {
-                            out.push(at as usize);
-                        }
-                    }
+            let (start, end) = (from.next_multiple_of(K64), to & !(K64 - 1));
+            // The parts of it below and above what is kept free.
+            for (a, b) in [(start, end.min(lo)), (start.max(hi), end)] {
+                if b <= a {
+                    continue;
+                }
+                let touching = (b == lo && end > lo) || (a == hi && start < hi);
+                if touching {
+                    reserve(a, b);
+                } else if b - a >= len {
+                    reserve(a + headroom, b);
                 }
             }
         }
-        if end <= here {
+        if to <= here {
             break;
         }
-        here = end;
+        here = to;
     }
     out
 }
@@ -363,7 +372,7 @@ mod tests {
         assert_ne!(base, 0);
         // SAFETY: our own reservation.
         unsafe { mem::VirtualFree(base as *mut _, 0, mem::MEM_RELEASE) };
-        let groomed = groom(base, len);
+        let groomed = groom(base, base + len, len);
         let made = make(&device, Kind::Custom, len as u64);
         for at in &groomed {
             // SAFETY: our own reservations.
@@ -375,5 +384,115 @@ mod tests {
         unsafe { std::ptr::write_bytes(data, 0x5a, len) };
         // SAFETY: our own buffer.
         unsafe { buffer.Unmap(0, None) };
+    }
+
+    /// What this PC's card and driver make of it (not WARP): run alone,
+    /// under the GPU lock, with `VICTORY_UMA_PROBE_CARD=1`:
+    /// `cargo test -p victory-gpu --lib uma::tests::card -- --include-ignored --test-threads=1 --nocapture`.
+    #[test]
+    #[ignore]
+    fn card_probe() {
+        if std::env::var_os("VICTORY_UMA_PROBE_CARD").is_none() {
+            return;
+        }
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        let mut device: Option<ID3D12Device> = None;
+        // SAFETY: plain device creation on the default adapter.
+        unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).expect("a device") };
+        let device = device.unwrap();
+        let state = |at: usize| {
+            // SAFETY: plain data filled in by the query.
+            let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid out pointer of the right size.
+            unsafe { mem::VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+            format!("state {:#x} type {:#x} protect {:#x} base {:#x} size {:#x}", info.State, info.Type, info.Protect, info.AllocationBase as usize, info.RegionSize)
+        };
+        for kind in [Kind::Custom, Kind::Upload] {
+            // Where the driver puts a mapping left to itself.
+            let t = std::time::Instant::now();
+            match make(&device, kind, 47 << 20) {
+                Ok((_h, b, data)) => {
+                    eprintln!("{kind:?} 47 MB, no grooming: mapped at {:#x} in {:.1} ms; {}", data as usize, t.elapsed().as_secs_f64() * 1e3, state(data as usize));
+                    // SAFETY: our own buffer.
+                    unsafe { b.Unmap(0, None) };
+                    drop(b);
+                    drop(_h);
+                    eprintln!("  after unmap and release: {}", state(data as usize));
+                }
+                Err(e) => eprintln!("{kind:?} 47 MB, no grooming: {e}"),
+            }
+            for mb in [47usize, 100, 185] {
+                let len = mb << 20;
+                // A hole below 4 GiB, as the title's 32-bit memory is.
+                let mut req = mem::MEM_ADDRESS_REQUIREMENTS { LowestStartingAddress: (256usize << 20) as *mut _, HighestEndingAddress: (u32::MAX as usize) as *mut _, Alignment: 0 };
+                let mut param: mem::MEM_EXTENDED_PARAMETER = unsafe { std::mem::zeroed() };
+                param.Anonymous1._bitfield = mem::MemExtendedParameterAddressRequirements as u64;
+                param.Anonymous2.Pointer = (&raw mut req).cast();
+                // SAFETY: a reservation of free address space, released at once.
+                let base = unsafe { mem::VirtualAlloc2(std::ptr::null_mut(), std::ptr::null(), len, mem::MEM_RESERVE, mem::PAGE_NOACCESS, &mut param, 1) } as usize;
+                assert_ne!(base, 0, "a hole below 4 GiB");
+                // SAFETY: our own reservation.
+                unsafe { mem::VirtualFree(base as *mut _, 0, mem::MEM_RELEASE) };
+                let t0 = std::time::Instant::now();
+                let groomed = groom(base, base + len, len);
+                let t1 = std::time::Instant::now();
+                let made = make(&device, kind, len as u64);
+                let t2 = std::time::Instant::now();
+                for at in &groomed {
+                    // SAFETY: our own reservations.
+                    unsafe { mem::VirtualFree(*at as *mut _, 0, mem::MEM_RELEASE) };
+                }
+                let t3 = std::time::Instant::now();
+                let ms = |a: std::time::Instant, b: std::time::Instant| (b - a).as_secs_f64() * 1e3;
+                match made {
+                    Ok((heap, buffer, data)) => {
+                        eprintln!(
+                            "{kind:?} {mb} MB: hole {base:#x}, mapped at {:#x} ({}); groom {:.1} ms ({} reservations), heap+buffer+map {:.1} ms, release {:.1} ms",
+                            data as usize,
+                            if data as usize == base { "IN THE HOLE" } else { "elsewhere" },
+                            ms(t0, t1),
+                            groomed.len(),
+                            ms(t1, t2),
+                            ms(t2, t3)
+                        );
+                        let n = 16 << 20;
+                        let mut scratch = vec![0x5au8; n];
+                        let t = std::time::Instant::now();
+                        // SAFETY: the mapping is at least `n` bytes.
+                        unsafe { std::ptr::copy_nonoverlapping(scratch.as_ptr(), data, n) };
+                        let w = t.elapsed().as_secs_f64();
+                        let t = std::time::Instant::now();
+                        // SAFETY: as above.
+                        unsafe { std::ptr::copy_nonoverlapping(data, scratch.as_mut_ptr(), 1 << 20) };
+                        let r = t.elapsed().as_secs_f64();
+                        eprintln!("  CPU writes {:.0} MiB/s, reads {:.0} MiB/s; {}", 16.0 / w, 1.0 / r, state(data as usize));
+                        // Whether the host's write watch can be asked about the mapping.
+                        let mut pages = vec![std::ptr::null_mut::<core::ffi::c_void>(); 64];
+                        let (mut count, mut grain) = (pages.len(), 0u32);
+                        // SAFETY: plain query with room for `count` addresses.
+                        let asked = unsafe { mem::GetWriteWatch(mem::WRITE_WATCH_FLAG_RESET, data.cast(), len, pages.as_mut_ptr(), &mut count, &mut grain) };
+                        // SAFETY: one byte of the mapping.
+                        unsafe { data.add(5 * 4096 + 7).write(1) };
+                        let mut again = pages.len();
+                        // SAFETY: as above.
+                        let asked2 = unsafe { mem::GetWriteWatch(0, data.cast(), len, pages.as_mut_ptr(), &mut again, &mut grain) };
+                        eprintln!(
+                            "  write watch: first asking {} ({} pages written, reset), after one store {} ({} pages, the first at +{:#x})",
+                            if asked == 0 { "ok" } else { "REFUSED" },
+                            count,
+                            if asked2 == 0 { "ok" } else { "REFUSED" },
+                            again,
+                            if again > 0 && asked2 == 0 { pages[0] as usize - data as usize } else { 0 }
+                        );
+                        // SAFETY: our own buffer.
+                        unsafe { buffer.Unmap(0, None) };
+                        drop(buffer);
+                        drop(heap);
+                        eprintln!("  after unmap and release: {}", state(data as usize));
+                    }
+                    Err(e) => eprintln!("{kind:?} {mb} MB: hole {base:#x}: REFUSED {e}; groom {:.1} ms ({} reservations), make {:.1} ms; the hole now: {}", ms(t0, t1), groomed.len(), ms(t1, t2), state(base)),
+                }
+            }
+        }
     }
 }
