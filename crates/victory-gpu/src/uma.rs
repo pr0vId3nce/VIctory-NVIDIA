@@ -98,12 +98,54 @@ static BOUNDS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// placed in them; stretches groomed and the reservations that took.
 static STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
-/// A heap of the driver's of `len` bytes (a multiple of 64 KiB) whose CPU
-/// mapping ends at or below `highest`: the mapping's address, for the
-/// caller to give the title as its memory. `None`: nothing was made.
-pub fn title_memory_backed_low(len: usize, highest: usize) -> Option<usize> {
+/// A place of `bytes` in the address space that ends at or below
+/// `highest`, free now: found by reserving it and letting it go. As high
+/// as the host gives one first (from 3 GiB on): what other threads
+/// allocate meanwhile goes to the lowest place that fits.
+fn place_below(bytes: usize, highest: usize) -> Option<usize> {
+    for lowest in [3usize << 30, K64] {
+        if lowest.saturating_add(bytes) > highest {
+            continue;
+        }
+        let mut wanted = mem::MEM_ADDRESS_REQUIREMENTS { LowestStartingAddress: lowest as *mut _, HighestEndingAddress: highest as *mut _, Alignment: 0 };
+        // SAFETY: plain data; zero is a valid value.
+        let mut parameter: mem::MEM_EXTENDED_PARAMETER = unsafe { std::mem::zeroed() };
+        parameter.Anonymous1._bitfield = mem::MemExtendedParameterAddressRequirements as u64;
+        parameter.Anonymous2.Pointer = (&raw mut wanted).cast();
+        // SAFETY: reserves free address space; the parameter points at
+        // `wanted`, which outlives the call.
+        let at = unsafe { mem::VirtualAlloc2(std::ptr::null_mut(), std::ptr::null(), bytes, mem::MEM_RESERVE, mem::PAGE_NOACCESS, &mut parameter, 1) };
+        if !at.is_null() {
+            // SAFETY: our own reservation.
+            unsafe { mem::VirtualFree(at, 0, mem::MEM_RELEASE) };
+            return Some(at as usize);
+        }
+    }
+    None
+}
+
+/// Title memory of `front + len` bytes that ends at or below `highest`:
+/// the first `front` bytes a placeholder (the caller's: memory the CPU
+/// reads, mapped as before), and right behind it a heap of the driver's of
+/// `len` bytes whose CPU mapping starts where the placeholder ends. Gives
+/// the placeholder's address; the heap is at that plus `front`. `None`:
+/// nothing was made.
+///
+/// The front is there because not all of a title's graphics memory can be
+/// the card's: its descriptor heap lies at the start of the same
+/// reservation (10 MiB of 185 in Grand Theft Auto VI, declared read-write
+/// where the parts behind it are write-combined), and every descriptor our
+/// code and the title's look at is a read of it.
+///
+/// The driver's mapping has to land on one address here, so every other
+/// free stretch that could take it is reserved for the moment of the call
+/// ([`groom`]) and the hole is closed in by reservations of ours on both
+/// sides. Another thread that allocates that much meanwhile can still take
+/// the hole: then the mapping lands elsewhere or is refused, and the
+/// caller reserves as before.
+pub fn title_memory_backed_behind(front: usize, len: usize, highest: usize) -> Option<usize> {
     let kind = kind();
-    if kind == Kind::Off || len % K64 != 0 || len == 0 {
+    if kind == Kind::Off || len % K64 != 0 || front % K64 != 0 || len == 0 {
         return None;
     }
     let host = crate::host::host()?;
@@ -112,10 +154,35 @@ pub fn title_memory_backed_low(len: usize, highest: usize) -> Option<usize> {
         return None;
     }
     let took = std::time::Instant::now();
-    // Left alone the driver maps either kind high in the title's process
-    // (the card's memory at the lowest free address in a small one, never
-    // here): only below `highest` is anything left that can take it.
-    let groomed = groom(0, highest.saturating_add(1), len);
+    let place = place_below(front + len + K64, highest)?;
+    let (hole, guard) = (place + front, place + front + len);
+    // SAFETY (all three): reservations of address space just found free;
+    // each is let go below unless it is handed on.
+    let front_at = if front == 0 {
+        place
+    } else {
+        unsafe {
+            mem::VirtualAlloc2(std::ptr::null_mut(), place as *const _, front, mem::MEM_RESERVE | mem::MEM_RESERVE_PLACEHOLDER, mem::PAGE_NOACCESS, std::ptr::null_mut(), 0) as usize
+        }
+    };
+    let guard_at = unsafe { mem::VirtualAlloc(guard as *const _, K64, mem::MEM_RESERVE, mem::PAGE_NOACCESS) } as usize;
+    let let_go = |front_too: bool| {
+        // SAFETY: our own reservations.
+        unsafe {
+            if guard_at != 0 {
+                mem::VirtualFree(guard_at as *mut _, 0, mem::MEM_RELEASE);
+            }
+            if front_too && front != 0 && front_at != 0 {
+                mem::VirtualFree(front_at as *mut _, 0, mem::MEM_RELEASE);
+            }
+        }
+    };
+    if front_at != place || guard_at != guard {
+        let_go(true);
+        tracing::warn!(place = format_args!("{place:#x}"), "UMA heap: the place found for it was taken meanwhile; title memory as before");
+        return None;
+    }
+    let groomed = groom(hole, guard, len);
     STATS[6].fetch_add(1, Ordering::Relaxed);
     STATS[7].fetch_add(groomed.len() as u64, Ordering::Relaxed);
     let groom_ms = took.elapsed().as_secs_f64() * 1000.0;
@@ -127,29 +194,31 @@ pub fn title_memory_backed_low(len: usize, highest: usize) -> Option<usize> {
     let (heap, buffer, data) = match made {
         Ok(made) => made,
         Err(e) => {
+            let_go(true);
             STATS[3].fetch_add(1, Ordering::Relaxed);
             tracing::warn!(len, error = %e, ?kind, "UMA heap: the host refused the heap; title memory as before");
             return None;
         }
     };
-    let base = data as usize;
-    if base == 0 || base % K64 != 0 || base.saturating_add(len - 1) > highest {
+    if data as usize != hole {
+        let_go(true);
         STATS[2].fetch_add(1, Ordering::Relaxed);
         tracing::warn!(
             len,
-            landed = format_args!("{base:#x}"),
-            highest = format_args!("{highest:#x}"),
+            wanted = format_args!("{hole:#x}"),
+            landed = format_args!("{:#x}", data as usize),
             groomed = groomed.len(),
             ?kind,
-            "UMA heap: the driver mapped the heap where the title cannot have it; title memory as before"
+            "UMA heap: the driver mapped the heap elsewhere than behind the title's front memory; title memory as before"
         );
         // SAFETY: our own buffer, mapped once.
         unsafe { buffer.Unmap(0, None) };
         return None;
     }
-    crate::host::name(&buffer, || format!("title memory {base:#x}+{len:#x} in a driver heap"));
+    let_go(false);
+    crate::host::name(&buffer, || format!("title memory {hole:#x}+{len:#x} in a driver heap"));
     let mut backed = BACKED.lock().unwrap_or_else(|e| e.into_inner());
-    backed.push(Backed { start: base as u64, end: (base + len) as u64, heap, buffer });
+    backed.push(Backed { start: hole as u64, end: (hole + len) as u64, heap, buffer });
     let lo = backed.iter().map(|b| b.start).min().unwrap_or(0);
     let hi = backed.iter().map(|b| b.end).max().unwrap_or(0);
     BOUNDS[0].store(lo, Ordering::Relaxed);
@@ -158,15 +227,16 @@ pub fn title_memory_backed_low(len: usize, highest: usize) -> Option<usize> {
     STATS[0].fetch_add(1, Ordering::Relaxed);
     STATS[1].fetch_add(len as u64, Ordering::Relaxed);
     tracing::info!(
-        base = format_args!("{base:#x}"),
+        front = format_args!("{place:#x}+{front:#x}"),
+        base = format_args!("{hole:#x}"),
         len,
         ?kind,
         groomed = groomed.len(),
         groom_ms,
         ms = took.elapsed().as_secs_f64() * 1000.0,
-        "UMA heap: title memory is a driver heap, mapped where the title has it (no copy, no refresh, nothing fetched back)"
+        "UMA heap: title memory behind its front part is a driver heap, mapped where the title has it (no copy, no refresh, nothing fetched back)"
     );
-    Some(base)
+    Some(place)
 }
 
 /// Whether `[at, at + len)` touches a driver heap of ours (a quick look).
@@ -226,7 +296,9 @@ pub(crate) fn place_for(start: u64, len: u64) -> Option<Placed> {
     };
     match (made, placed) {
         (Ok(()), Some(buffer)) => {
-            STATS[4].fetch_add(1, Ordering::Relaxed);
+            if STATS[4].fetch_add(1, Ordering::Relaxed) < 16 {
+                tracing::info!(start = format_args!("{start:#x}"), len, "UMA heap: a title buffer or window placed in the driver heap");
+            }
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
             Some(Placed { buffer, heap: heap.0, gpu, bias: start - at })

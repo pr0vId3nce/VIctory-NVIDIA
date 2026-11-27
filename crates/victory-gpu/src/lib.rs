@@ -140,7 +140,7 @@ pub fn frames_begun() -> u64 {
     frame::current()
 }
 #[cfg(windows)]
-pub use uma::{title_memory_backed_low, uma_heap_on};
+pub use uma::{title_memory_backed_behind, uma_heap_on};
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
 #[cfg(windows)]

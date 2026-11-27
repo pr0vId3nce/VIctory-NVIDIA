@@ -96,6 +96,14 @@ pub extern "system" fn XMemVirtualAlloc(
     // (`VICTORY_UMA_HEAP`): there already, and nothing of the host's to
     // change.
     if !base.is_null() && uma_backed(base as usize, size.max(1)) {
+        tracing::info!(
+            at = format_args!("{:#x}", base as usize),
+            size,
+            kind = format_args!("{kind:#x}"),
+            flags = format_args!("{flags:#x}"),
+            protect = format_args!("{protect:#x}"),
+            "UMA heap: the title asks for memory inside the driver heap that is its reservation (a part of it, with its protection)"
+        );
         return base;
     }
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
@@ -1835,13 +1843,38 @@ fn uma_reserve(size: usize, highest: usize) -> Option<usize> {
     if !uma_on() || on_wine() || size % PAGE != 0 || size < 16 * MIB {
         return None;
     }
-    let Some(at) = victory_gpu::title_memory_backed_low(size, highest) else {
+    // The front of the reservation stays memory of the CPU's, a
+    // placeholder that takes views as before: the title's descriptor heap
+    // and what lies beside it (10 + 1 MiB in Grand Theft Auto VI; the
+    // buffer its shaders read starts right behind). Our code and the
+    // title's read every descriptor there.
+    // `VICTORY_UMA_HEAP_FRONT_MB`: how much (11).
+    static FRONT: LazyLock<usize> =
+        LazyLock::new(|| std::env::var("VICTORY_UMA_HEAP_FRONT_MB").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(11) * MIB);
+    let front = *FRONT;
+    if front >= size || front % PAGE != 0 {
+        return None;
+    }
+    let Some(at) = victory_gpu::title_memory_backed_behind(front, size - front, highest) else {
         UMA_STATS[1].fetch_add(1, Ordering::Relaxed);
         return None;
     };
-    UMA_BACKED.lock().unwrap_or_else(|e| e.into_inner()).push((at, size));
+    UMA_BACKED.lock().unwrap_or_else(|e| e.into_inner()).push((at + front, size - front));
     UMA_STATS[0].fetch_add(1, Ordering::Relaxed);
+    if front > 0 {
+        UMA_FRONTS.lock().unwrap_or_else(|e| e.into_inner()).push((at, front));
+        victory_gpu::title_memory_allocated(at, front);
+    }
     Some(at)
+}
+
+/// The placeholders in front of [`UMA_BACKED`] memory ([`uma_reserve`]):
+/// address and bytes.
+static UMA_FRONTS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+/// Whether `[base, base + len)` lies in such a front.
+fn uma_front(base: usize, len: usize) -> bool {
+    uma_on() && UMA_FRONTS.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(at, n)| at <= base && base + len <= at + n)
 }
 
 /// The ranges of [`UMA_BACKED`] memory the title has mapped pages at.
@@ -1853,6 +1886,7 @@ static UMA_SHOWN: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 /// them before they were mapped) is copied in, and the pages are noted as
 /// shown there, for [`uma_written`].
 fn uma_show(base: usize, len: usize, slice: &Slice) {
+    tracing::info!(at = format_args!("{base:#x}"), len, "UMA heap: the title maps physical pages inside the driver heap");
     {
         let mut shown = UMA_SHOWN.lock().unwrap_or_else(|e| e.into_inner());
         if shown.iter().any(|&(at, n)| at < base + len && base < at + n) {
@@ -2178,6 +2212,16 @@ extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u
         if kind & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) == 0 {
             uma_said("the title frees title memory that is a driver heap: left as it is", address as usize, size);
         }
+        return 1;
+    }
+    // In front of such memory the title cuts its reservation into parts as
+    // if it were one placeholder: the cut that would have split the last
+    // part of the front off the rest finds that part a placeholder of its
+    // own already (the rest is the heap), which the host refuses. It is
+    // done all the same.
+    if kind & MEM_PRESERVE_PLACEHOLDER != 0 && uma_front(address as usize, size.max(1)) {
+        // SAFETY: the title's own arguments, on a placeholder of ours.
+        unsafe { VirtualFree(address, size, kind) };
         return 1;
     }
     // Splitting and joining placeholders changes nothing they show.
