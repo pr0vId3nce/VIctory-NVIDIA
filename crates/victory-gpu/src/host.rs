@@ -6702,9 +6702,22 @@ impl HostList {
     /// for).
     pub(crate) fn reset(&self) {
         // Open and reset already, nothing recorded since ([`HostList::spare`]).
-        if self.spare.swap(false, Ordering::Relaxed) && self.untouched() {
-            self._alive.used();
-            return;
+        if self.spare.swap(false, Ordering::Relaxed) {
+            if self.untouched() {
+                self._alive.used();
+                return;
+            }
+            // Recorded into before this reset: closed first, as it was when
+            // a submission took its place (an open list refuses the reset,
+            // and its close has work of its own). What it holds goes with
+            // the reset, as it did then.
+            static TOLD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if TOLD.fetch_add(1, Ordering::Relaxed) < 8 {
+                tracing::warn!(
+                    "a host list kept open for its title's next reset (VICTORY_LIST_SPARE) was recorded into before it: closed, then reset"
+                );
+            }
+            self.close();
         }
         self.changed_something();
         #[cfg(feature = "diagnostics")]
