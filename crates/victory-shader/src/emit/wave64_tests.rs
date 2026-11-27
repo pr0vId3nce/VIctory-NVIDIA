@@ -1010,3 +1010,41 @@ fn the_console_threads_of_a_two_dimensional_group_are_each_given_once() {
     }
     eprintln!("ran on the hardware device: 64 of 64 console threads, each once");
 }
+
+/// `ds_bpermute_b32` in a console wave of 64 reads within the lane's own 32-lane half: GFX10
+/// permutes the two halves on their own (LLVM's `supportsWaveWideBPermute`, Mesa ACO's
+/// `emit_bpermute`). Lane t names lane t ^ 33, in the other half, and reads lane t ^ 1. Lowered
+/// for 64-lane and 32-lane host waves alike; before, the first read t ^ 33 and the second
+/// refused ("a lane permute across two host waves"). From Belobug PR #363.
+#[test]
+fn a_backward_permute_reads_within_the_lanes_half() {
+    let body = [
+        0x3A08_00A1, // v_xor_b32 v4, 33, v0
+        0x3408_0882, // v_lshlrev_b32 v4, 2, v4
+        0xDACC_0000,
+        0x0200_0004, // ds_bpermute_b32 v2, v4, v0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0xE070_1000,
+        0x8002_0201, // buffer_store_dword v2, v1, s[8:11], 0 offen
+    ];
+    let mut ran = Vec::new();
+    for threads in [64, 128] {
+        let native = native_of(&body, true, threads);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        for host_wave in [64, 32] {
+            let shader = lowered_on(&native, &p, &HashSet::new(), host_wave)
+                .unwrap_or_else(|e| panic!("{threads} threads, host waves of {host_wave}: {e:?}"));
+            if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+                v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
+            }
+            let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(out) = whole_uav(&shader, [0, 0], threads) {
+                let want: Vec<u32> = (0..threads).map(|t| t ^ 1).collect();
+                assert_eq!(out, want, "{threads} threads, host waves of {host_wave}");
+                ran.push((threads, host_wave));
+            }
+        }
+    }
+    eprintln!("ran on the hardware device (threads, host wave): {ran:?}");
+}
