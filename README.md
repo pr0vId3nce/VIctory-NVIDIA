@@ -19,7 +19,7 @@
 | Your card | Frame generation | Limits |
 | --- | --- | --- |
 | GeForce RTX 40 and RTX 50 | **DLSS frame generation** | 2x on RTX 40; more than 2x (up to 6x) needs an RTX 50 |
-| GeForce RTX 20 and RTX 30 | **AMD FSR 3 frame generation** (DLSS frame generation needs an RTX 40 or later) | **2x at most**. DLSS upscaling still works on these cards, so the Series X profile is fine |
+| GeForce RTX 20 and RTX 30 | **AMD FSR 3 frame generation**, or **DLSS multi frame generation (MFG) through the [MFG Unlocker](https://github.com/dashdogy/MFG-Unlocker) mod** (F1, MFG UNLOCKER; see [below](#mfg-unlocker)) | FSR 3: **2x at most**. MFG Unlocker: a third-party mod, not made or supported by NVIDIA or by this fork; NVIDIA itself offers DLSS frame generation only on RTX 40 and later. DLSS upscaling works on these cards either way, so the Series X profile is fine |
 | Other cards (no DLSS) | **AMD FSR 3 frame generation** | **2x at most, Series S profile only** (F1 menu, CONSOLE): without DLSS the game's own upscaler, which FSR 3 needs, only takes the Series S sizes. Not tested here |
 
 - **At every start the game tells you** which one your card runs, and why
@@ -79,10 +79,13 @@
   on. So the first start plays about 20 seconds, says so at the top of the
   picture, and starts the game again. It doesn't happen again for that version
   (a mark is kept in `%LOCALAPPDATA%\victory\warmed`).
-- RTX 20 and 30 cards can try DLSS frame generation with the
-  [MFG Unlocker](https://github.com/dashdogy/MFG-Unlocker) mod (not ours, and
-  not tested with this fork, which was only run on an RTX 50). It is an option,
-  off by default: **F1, MFG UNLOCKER, ON**, then restart. On, the next start
+- <a id="mfg-unlocker"></a>**RTX 20 and 30 cards: DLSS multi frame generation
+  (MFG) works through the [MFG Unlocker](https://github.com/dashdogy/MFG-Unlocker)
+  mod.** The fork supports loading it, but the mod is someone else's: it is not
+  made or supported by NVIDIA (whose DLSS frame generation is for RTX 40 and
+  later) or by this fork, and we have not tested it on an RTX 20 or 30
+  ourselves. It is an option, off by default: **F1, MFG UNLOCKER, ON**, then
+  restart. On, the next start
   downloads it by itself from the mod's own GitHub release (v1.7.2, about 5 MB,
   checked against the SHA-256 its author published) into
   `%LOCALAPPDATA%\victory\mfg-unlocker`, and every start loads it. Nothing is
@@ -92,7 +95,7 @@
   menu. The start's notice says "UNLOCKED BY A MOD" and the log says it was
   loaded. If the game crashes or frame generation fails, turn it off in F1 (or
   add `VICTORY_MFG_UNLOCKER=` to `%LOCALAPPDATA%\victory\victory-settings.txt`).
-  FSR 3 frame generation (2x) is the supported way on those cards. A
+  FSR 3 frame generation (2x) is the fully supported way on those cards. A
   `winmm.dll` copy of the mod beside `victory.exe` still works too.
 
 **In the game**
