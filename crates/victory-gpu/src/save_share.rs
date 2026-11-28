@@ -468,11 +468,18 @@ pub fn apply(data: &Path, share: &Path, stamp: &str) -> io::Result<Option<PathBu
     Ok(Some(backup.unwrap_or_else(|| data.join(PARTS[0]))))
 }
 
+/// Where exports and an import's backup go: the folder `VICTORY_SAVE_SHARE` already names
+/// (a launcher's, to keep the game's folder untouched), else `Saves` in `game`.
+fn share_folder(game: &Path, set: Option<std::ffi::OsString>) -> PathBuf {
+    set.filter(|v| !v.is_empty()).map(PathBuf::from).unwrap_or_else(|| game.join("Saves"))
+}
+
 /// At start, before the title runs: the folders the menu uses (`data`,
-/// `<data>\<title id>`; `Saves` in `game`, the executable's folder), and a
-/// staged import put in place. A line for the console, if one was.
+/// `<data>\<title id>`; `Saves` in `game`, the executable's folder, unless
+/// `VICTORY_SAVE_SHARE` names another), and a staged import put in place. A
+/// line for the console, if one was.
 pub fn start(data: &Path, game: &Path) -> Option<String> {
-    let share = game.join("Saves");
+    let share = share_folder(game, std::env::var_os("VICTORY_SAVE_SHARE"));
     // SAFETY: set once at start, before the title's and our threads read them.
     unsafe {
         std::env::set_var("VICTORY_SAVE_DATA", data);
@@ -512,6 +519,14 @@ mod tests {
     }
 
     const SLOT: &str = "saves/0009000000000001/00000000-0000-0000-0000-00007952987a/Player~333dc56ddffd8ea0/v34/0";
+
+    #[test]
+    fn a_share_folder_already_set_is_kept() {
+        let game = Path::new(r"C:\Games\title");
+        assert_eq!(share_folder(game, None), game.join("Saves"));
+        assert_eq!(share_folder(game, Some("".into())), game.join("Saves"));
+        assert_eq!(share_folder(game, Some(r"D:\play\Saves".into())), PathBuf::from(r"D:\play\Saves"));
+    }
 
     #[test]
     fn an_exported_zip_imports_on_another_pc_and_the_old_save_is_kept() {
